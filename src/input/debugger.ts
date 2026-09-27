@@ -261,7 +261,10 @@ export class DebuggerInputTier implements InputTier {
     const button = opts.button ?? 'left';
     const clickCount = opts.clickCount ?? 1;
 
-    await this.sendInput('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
+    // Arrive along the humanized path rather than teleporting: `moveTo` from the
+    // current position is a no-op when already there, so routing every click through
+    // it costs nothing for callers (like `RunInput`) that moved first.
+    await this.moveTo(x, y);
     await this.sendInput('Input.dispatchMouseEvent', {
       type: 'mousePressed',
       x,

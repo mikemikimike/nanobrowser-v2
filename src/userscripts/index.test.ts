@@ -25,6 +25,39 @@ describe('handleUserscriptMessage', () => {
     expect(scripts.map((script) => script.name)).toEqual(BUNDLED_USERSCRIPTS.map((seed) => seed.name));
   });
 
+  it('fills an empty name and matches from the header and ignores @grant', async () => {
+    const reply = await handleUserscriptMessage({
+      type: 'userscript.save',
+      payload: {
+        id: 'pasted',
+        name: 'new script',
+        matches: ['*://*/*'],
+        code: `// ==UserScript==
+// @name ebay ram
+// @match https://www.ebay.com/*
+// @grant none
+// ==/UserScript==
+return 1;`,
+        updatedAt: 0,
+      },
+    });
+
+    expect(reply?.type).toBe('userscript.list');
+    const [saved] = await listUserscripts();
+    expect(saved?.name).toBe('ebay ram');
+    expect(saved?.matches).toEqual(['https://www.ebay.com/*']);
+    expect(saved?.code).not.toContain('@grant');
+    expect(saved?.code.trim()).toBe('return 1;');
+
+    const api = vmUserScriptsApi();
+    const run = await handleUserscriptMessage(
+      { type: 'userscript.run', payload: { scriptId: 'pasted' } },
+      { tabId: 4, url: 'https://www.ebay.com/sch/i.html', api },
+    );
+    expect(run).toMatchObject({ type: 'userscript.result', payload: { ok: true, value: 1 } });
+    expect(api.injections[0]?.world).toBe('USER_SCRIPT');
+  });
+
   it('saves a script and replies with the refreshed list', async () => {
     const reply = await handleUserscriptMessage({
       type: 'userscript.save',

@@ -50,6 +50,14 @@ describe('snapshot format', () => {
     expect(snapshot().text).toContain('{type=text value="shoes"}');
   });
 
+  it('withholds the value of a filled password input (R-12)', () => {
+    mount('<input type="password" aria-label="Password">');
+    (document.querySelector('input') as HTMLInputElement).value = 's3cr3t-hunter2';
+    const text = snapshot().text;
+    expect(text).toContain('- textbox "Password" [ref=e1] {type=password}');
+    expect(text).not.toContain('s3cr3t-hunter2');
+  });
+
   it('marks disabled controls without dropping them', () => {
     mount('<button disabled>Pay now</button>');
     expect(snapshot().text).toBe('- button "Pay now" [ref=e1] {disabled=true}');

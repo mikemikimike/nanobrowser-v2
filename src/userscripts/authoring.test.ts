@@ -7,7 +7,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
 import type { Userscript } from '@/src/messaging';
 import { MAX_AGENT_SCRIPTS, checkAgentMatches, writeAgentUserscript } from './authoring';
-import { getUserscript, listUserscripts, saveUserscript } from './catalog';
+import { getUserscript, listUserscripts, saveUserscript, seedDefaults } from './catalog';
+import { EBAY_RAM_COMPS } from './examples';
 
 const good = {
   name: 'chatgpt-thread-extract',
@@ -98,6 +99,41 @@ describe('writeAgentUserscript', () => {
 
   // The rail with real teeth: a user's script is work the agent did not do and
   // cannot reconstruct.
+  it('refuses to write a bundled id and says to create a copy', async () => {
+    await seedDefaults();
+    const result = await writeAgentUserscript({
+      scriptId: EBAY_RAM_COMPS.id,
+      name: 'ebay-ram-comps',
+      matches: ['*://www.ebay.com/*'],
+      code: 'return 1;',
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.join(' ')).toContain('Omit scriptId to create a copy of your own');
+  });
+
+  it('can revise a new script that copies the bundled code', async () => {
+    const created = await writeAgentUserscript({
+      name: 'my-ram',
+      matches: ['*://www.ebay.com/*'],
+      code: EBAY_RAM_COMPS.code,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const revised = await writeAgentUserscript({
+      scriptId: created.script.id,
+      name: 'my-ram',
+      matches: ['*://www.ebay.com/*'],
+      code: 'return { summary: [], rows: [] };',
+    });
+    expect(revised.ok).toBe(true);
+    if (!revised.ok) return;
+    expect(revised.created).toBe(false);
+    expect(revised.script.code).toContain('summary');
+  });
+
   it('refuses to overwrite a script the user wrote', async () => {
     const mine = await saveUserscript({ name: 'mine', matches: ['*://chatgpt.com/*'], code: 'return 1;' });
     expect(mine.author).toBeUndefined();

@@ -108,7 +108,7 @@ export interface UserscriptRunResult {
 
 /** Side panel -> service worker. `type` on the wire is the key. */
 export interface PanelToWorker {
-  'run.start': { prompt: string; config: Config };
+  'run.start': { prompt: string; config: Config; followerVision?: boolean };
   'run.pause': { runId: RunId };
   'run.resume': { runId: RunId };
   'run.abort': { runId: RunId };
@@ -118,6 +118,10 @@ export interface PanelToWorker {
   'userscript.list': Record<string, never>;
   'userscript.save': Userscript;
   'userscript.delete': { id: string };
+  /** Sets the stop flag the running script polls. It does not abort `execute()`. */
+  'userscript.stop': Record<string, never>;
+  /** Writes the last panel run through the host artifact path. */
+  'userscript.saveResult': { filename?: string };
   'runlog.replay': { runId: RunId };
   /**
    * A panel-side diagnostic, relayed by the worker to the native host's ext.log
@@ -134,6 +138,7 @@ export interface WorkerToPanel {
   'readiness': Readiness;
   'userscript.result': UserscriptRunResult;
   'userscript.list': { scripts: Userscript[] };
+  'userscript.saved': { filename: string; path: string; bytes: number; note?: string };
   'runlog.replay': { runId: RunId; events: RunEvent[] };
   'error': { message: string; inReplyTo?: string };
 }

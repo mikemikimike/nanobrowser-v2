@@ -9,41 +9,42 @@
     "postinstall": "wxt prepare",
     "typecheck": "tsc --noEmit",
     "test": "vitest run && bash scripts/check-invariants.sh",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "harness": "bash scripts/harness.sh"
   },
   "dependencies": {
-    "@langchain/core": "1.2.9",
-    "@langchain/langgraph": "1.4.13",
+    "@langchain/core": "1.2.11",
+    "@langchain/langgraph": "1.4.16",
     "@langchain/langgraph-checkpoint": "1.1.5",
-    "@langchain/openai": "1.5.11",
+    "@langchain/openai": "1.5.13",
     "idb": "^8.0.3",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "zod": "^4.5.4"
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@langchain/langgraph-checkpoint-validation": "1.1.1",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^14.6.7",
-    "@types/chrome": "0.2.8",
-    "@types/react": "19.2.14",
-    "@types/react-dom": "19.2.4",
+    "@types/chrome": "0.3.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "@wxt-dev/module-react": "1.2.2",
     "fake-indexeddb": "^6.2.5",
-    "jsdom": "^30.0.1",
+    "jsdom": "^30.1.0",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
-    "vite": "8.2.2",
+    "vite": "8.3.0",
     "vitest": "4.1.11",
     "wxt": "0.21.4"
   },
   "pnpm": {
     "overrides": {
-      "shell-quote": ">=1.8.5",
-      "adm-zip": ">=0.6.0",
-      "tmp": ">=0.2.6",
-      "ajv@>=7.0.0 <8.18.0": ">=8.18.0",
+      "shell-quote": ">=1.10.0",
+      "adm-zip": ">=0.6.1",
+      "tmp": ">=0.2.7",
+      "ajv@>=7.0.0 <8.18.0": ">=8.20.0",
       "uuid@<11.1.1": ">=11.1.1"
     }
   }

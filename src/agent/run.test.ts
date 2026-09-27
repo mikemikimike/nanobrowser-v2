@@ -99,6 +99,125 @@ describe('safety valve (R-04)', () => {
   });
 });
 
+describe('repeat-failure stall detection (M2)', () => {
+  const alwaysBogus = (): FakeTurn => ({ kind: 'tool', name: 'bogus_tool', args: {} });
+
+  it('ends with an error naming the action when the same action fails identically twice', async () => {
+    const { events, ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 5,
+      follower: alwaysBogus,
+    });
+
+    // Stops after 2 failing steps, long before the step budget.
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 2 });
+    expect(ended.message).toContain(
+      'the follower repeated the same failing action 2 times (bogus_tool): no such tool: bogus_tool',
+    );
+    const signals = events.filter((e) => e.kind === 'follower.signal');
+    expect(signals.at(-1)).toMatchObject({ signal: 'CONTINUE' });
+    expect((signals.at(-1) as Extract<RunEvent, { kind: 'follower.signal' }>).note).toContain(
+      'the follower repeated the same failing action 2 times (bogus_tool): no such tool: bogus_tool',
+    );
+  });
+
+  it('counts identical failures across prose turns, like the live allow-list loop', async () => {
+    const { ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 5,
+      follower: (call) =>
+        call.index === 1
+          ? { kind: 'text', text: 'the script seems blocked, trying again' }
+          : { kind: 'tool', name: 'bogus_tool', args: {} },
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 3 });
+  });
+
+  it('resets the repeat counter when a page-changing action succeeds between failures', async () => {
+    const { ended } = await harness({
+      maxSteps: 4,
+      planningInterval: 10,
+      follower: (call) =>
+        call.index % 2 === 0
+          ? { kind: 'tool', name: 'bogus_tool', args: {} }
+          : { kind: 'tool', name: 'click', args: { ref: 'e1', signal: 'CONTINUE' } },
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'max-steps', steps: 4 });
+  });
+
+  it('does not let successful reads break the repeat chain', async () => {
+    const { ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 10,
+      follower: (call) =>
+        call.index === 1
+          ? { kind: 'tool', name: 'snapshot', args: {} }
+          : { kind: 'tool', name: 'bogus_tool', args: {} },
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 3 });
+  });
+
+  it('does not let waits break the repeat chain either: waiting is not progress', async () => {
+    const { ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 10,
+      follower: (call) =>
+        call.index === 1
+          ? { kind: 'tool', name: 'wait', args: { ms: 100 } }
+          : { kind: 'tool', name: 'bogus_tool', args: {} },
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 3 });
+  });
+
+  it('does not let file saves break the repeat chain either: saving is not page progress', async () => {
+    const { ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 10,
+      follower: (call) =>
+        call.index === 1
+          ? { kind: 'tool', name: 'save_file', args: { filename: 'n.json', content: '{}' } }
+          : { kind: 'tool', name: 'bogus_tool', args: {} },
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 3 });
+  });
+
+  it('trips when the same action is refused as a batch extra every turn', async () => {
+    const { ended } = await harness({
+      maxSteps: 10,
+      planningInterval: 10,
+      follower: () => ({
+        kind: 'tools',
+        calls: [
+          { name: 'snapshot', args: {} },
+          { name: 'bogus_tool', args: {} },
+        ],
+      }),
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 2 });
+    expect(ended.message).toContain('the follower repeated the same failing action 2 times (bogus_tool)');
+  });
+
+  it('treats the same-shaped call failing with a different error as a new failure', async () => {
+    const { ended } = await harness({
+      maxSteps: 4,
+      planningInterval: 10,
+      follower: (call) => ({
+        kind: 'tool',
+        name: call.index % 2 === 0 ? 'bogus_tool_a' : 'bogus_tool_b',
+        args: {},
+      }),
+    });
+
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'max-steps', steps: 4 });
+  });
+});
+
 describe('pause and resume', () => {
   it('drains at a step boundary and resumes from the checkpoint with the step count intact', async () => {
     const { events, ended } = await harness({

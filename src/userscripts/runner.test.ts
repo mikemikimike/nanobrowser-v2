@@ -7,8 +7,10 @@ import {
   detectChromeMajorVersion,
   isAvailable,
   parseErrorLocation,
+  notifyUserscriptProgress,
   resetWorldConfiguration,
   runUserscript,
+  setUserscriptProgressListener,
   wrapUserscript,
 } from './runner';
 import { availableEnv, vmUserScriptsApi } from './testing';
@@ -41,7 +43,10 @@ describe('runUserscript', () => {
     await runUserscript({ tabId: 1, script: script('return 1;'), url: URL_IN_SCOPE, api });
     await runUserscript({ tabId: 1, script: script('return 2;'), url: URL_IN_SCOPE, api });
 
-    expect(api.worldConfigs).toEqual([{ messaging: false, csp: undefined }]);
+    expect(api.worldConfigs).toEqual([
+      { messaging: false, csp: undefined },
+      { worldId: 'nanobrowser', messaging: true, csp: undefined },
+    ]);
   });
 
   it('returns the script value and the captured console lines', async () => {
@@ -273,5 +278,231 @@ describe('wrapper mechanics', () => {
     });
     expect(parseErrorLocation('Error: x\n    at userscript.js:2:9')).toBeNull();
     expect(parseErrorLocation(null)).toBeNull();
+  });
+});
+
+describe('runUserscript progress, stop, and bad returns', () => {
+  beforeEach(() => {
+    resetWorldConfiguration();
+  });
+
+  it('sends a console line before the script returns', async () => {
+    const seen: string[] = [];
+    const previous = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: { sendMessage: (message: { text?: string }) => seen.push(String(message.text)) },
+    };
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: script("console.log('before'); await Promise.resolve(); return seenLength;".replace('seenLength', String(0))),
+        url: URL_IN_SCOPE,
+        reportProgress: true,
+        api: vmUserScriptsApi(),
+      });
+      expect(seen).toContain('before');
+      expect(result.ok).toBe(true);
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previous;
+    }
+  });
+
+  it('stops between two fetches and does not start the second', async () => {
+    const urls: string[] = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith('/a')) {
+        const g = globalThis as { __nbUserscriptStopEpoch?: number };
+        g.__nbUserscriptStopEpoch = (g.__nbUserscriptStopEpoch ?? 0) + 1;
+      }
+      return new Response('ok');
+    }) as typeof fetch;
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: script(`
+          await fetch('/a');
+          if (nb.stopped) return { stopped_early: true };
+          await fetch('/b');
+          return { stopped_early: false };
+        `),
+        url: URL_IN_SCOPE,
+        api: vmUserScriptsApi(),
+      });
+      expect(result.ok).toBe(true);
+      expect(result.value).toEqual({ stopped_early: true });
+      expect(urls).toEqual(['/a']);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it('returns the partial when the deadline passes and leaves the fetch pending', async () => {
+    let finished = false;
+    let finish: (() => void) | undefined;
+    const previous = globalThis.fetch;
+    globalThis.fetch = (() =>
+      new Promise((resolve) => {
+        finish = () => {
+          finished = true;
+          resolve(new Response('late'));
+        };
+      })) as typeof fetch;
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: script(`
+          nb.partial = { summary: [], meta: { stopped_early: true, reason: 'timeout' }, log: [], rows: [] };
+          await fetch('/slow');
+          return { late: true };
+        `),
+        url: URL_IN_SCOPE,
+        deadlineMs: 30,
+        api: vmUserScriptsApi(),
+      });
+      expect(finished).toBe(false);
+      expect(result.ok).toBe(true);
+      expect(result.value).toMatchObject({ meta: { stopped_early: true, reason: 'timeout' } });
+      finish?.();
+      expect(finished).toBe(true);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it('streams nothing from a run that did not ask to report progress, such as a panel run', async () => {
+    const seen: string[] = [];
+    const previous = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: { sendMessage: (message: { text?: string }) => seen.push(String(message.text)) },
+    };
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: script("console.log('panel line'); return 1;"),
+        url: URL_IN_SCOPE,
+        api: vmUserScriptsApi(),
+      });
+      expect(result.ok).toBe(true);
+      expect(seen).toEqual([]);
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previous;
+    }
+  });
+
+  it('attributes progress to the execution that sent it and ignores unknown tokens', async () => {
+    const heard: Array<[string, string]> = [];
+    setUserscriptProgressListener((scriptId, line) => heard.push([scriptId, line.text]));
+    const previous = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: { sendMessage: (message: { token?: unknown; text?: unknown }) => notifyUserscriptProgress(message) },
+    };
+    try {
+      await runUserscript({
+        tabId: 1,
+        script: { ...script("console.log('from agent'); return 1;"), id: 'agent-script' },
+        url: URL_IN_SCOPE,
+        reportProgress: true,
+        api: vmUserScriptsApi(),
+      });
+      notifyUserscriptProgress({ token: 'agent-script:999', text: 'stale' });
+      expect(heard).toEqual([['agent-script', 'from agent']]);
+    } finally {
+      setUserscriptProgressListener(undefined);
+      (globalThis as { chrome?: unknown }).chrome = previous;
+    }
+  });
+
+  it('keeps a stop for the running script when another script starts before it checks', async () => {
+    const previous = globalThis.fetch;
+    const other: Array<Promise<unknown>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/a')) {
+        const g = globalThis as { __nbUserscriptStopEpoch?: number };
+        g.__nbUserscriptStopEpoch = (g.__nbUserscriptStopEpoch ?? 0) + 1;
+        other.push(runUserscript({ tabId: 1, script: script('return nb.stopped;'), url: URL_IN_SCOPE, api: vmUserScriptsApi() }));
+      }
+      return new Response('ok');
+    }) as typeof fetch;
+    try {
+      const first = await runUserscript({
+        tabId: 1,
+        script: script(`await fetch('/a'); return nb.stopped;`),
+        url: URL_IN_SCOPE,
+        api: vmUserScriptsApi(),
+      });
+      const second = (await other[0]) as { value: unknown };
+      expect(first.value).toBe(true);
+      expect(second.value).toBe(false);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it('does not hand one run\'s partial to the next run that fails', async () => {
+    await runUserscript({
+      tabId: 1,
+      script: script("nb.partial = { rows: ['old'] }; return 1;"),
+      url: URL_IN_SCOPE,
+      api: vmUserScriptsApi(),
+    });
+    const result = await runUserscript({
+      tabId: 1,
+      script: script("throw new Error('boom');"),
+      url: URL_IN_SCOPE,
+      api: vmUserScriptsApi(),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.value).toBeUndefined();
+  });
+
+  it('keeps the console when a return value is rejected after the run', async () => {
+    const result = await runUserscript({
+      tabId: 1,
+      script: script("console.log('got here'); return document.createElement('div');"),
+      url: URL_IN_SCOPE,
+      api: vmUserScriptsApi(),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.console.map((line) => line.text)).toContain('got here');
+  });
+
+  it('reports an IIFE that returns nothing', async () => {
+    const result = await runUserscript({
+      tabId: 1,
+      script: script('(function () { return { rows: [] }; })();'),
+      url: URL_IN_SCOPE,
+      api: vmUserScriptsApi(),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Return the JSON');
+  });
+
+  it('names the type when the script returns a DOM node', async () => {
+    const result = await runUserscript({
+      tabId: 1,
+      script: script("return document.createElement('div');"),
+      url: URL_IN_SCOPE,
+      api: vmUserScriptsApi(),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('DIV');
+  });
+
+  it('reports a syntax error on the user line, not the wrapper line', async () => {
+    const api = vmUserScriptsApi();
+    api.execute = async () =>
+      [{ documentId: 'doc-1', frameId: 0, error: `userscript.js:${WRAPPER_LINE_OFFSET + 12}:1 SyntaxError: Unexpected token` }] as never;
+    const result = await runUserscript({
+      tabId: 1,
+      script: script('return 1;'),
+      url: URL_IN_SCOPE,
+      api,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('line 12');
+    expect(result.error).not.toContain(`line ${WRAPPER_LINE_OFFSET + 12}`);
   });
 });

@@ -49,6 +49,8 @@ export interface PanelApi {
   scriptsStatus: AreaStatus;
   scriptResult?: UserscriptRunResult;
   scriptRunStatus: AreaStatus;
+  /** Where Save JSON wrote the last result, once the host confirms it. */
+  scriptSaved?: WorkerToPanel['userscript.saved'];
 
   log: RunLogState;
   /** True between sending `run.start` and the worker's first event for that run. */
@@ -63,6 +65,8 @@ export interface PanelApi {
   abortRun: () => void;
   saveScript: (script: Userscript) => void;
   runScript: (scriptId: string, code: string) => void;
+  stopScript: () => void;
+  saveScriptResult: (value: unknown) => void;
   deleteScript: (id: string) => void;
 }
 
@@ -75,6 +79,7 @@ const WORKER_TYPES: ReadonlySet<string> = new Set<keyof WorkerToPanel>([
   'readiness',
   'userscript.result',
   'userscript.list',
+  'userscript.saved',
   'runlog.replay',
   'error',
 ]);
@@ -88,6 +93,22 @@ function asWorkerMessage(envelope: Envelope<unknown>): WorkerMessage | undefined
 }
 
 type PanelChannel = Channel<HubOutbound | WorkerToPanel[keyof WorkerToPanel], HubInbound | PanelToWorker[keyof PanelToWorker]>;
+
+/**
+ * The configured Follower's catalog vision flag, if the fetched catalog names it.
+ * Same id on both gateways prefers the configured source (or openrouter, the run's
+ * default, when no source is configured). A source mismatch is unknown, not a
+ * fallback: with a partial catalog the surviving gateway's flag describes a model
+ * the run is not routed to.
+ */
+export function followerVisionFor(models: ModelInfo[], config: Config): boolean | undefined {
+  const candidates = models.filter((m) => m.id === config.followerModel);
+  const wantSource = config.followerModelSource ?? 'openrouter';
+  const follower = candidates.find((m) => m.source === wantSource) ?? candidates[0];
+  if (!follower) return undefined;
+  if (follower.source !== undefined && follower.source !== wantSource) return undefined;
+  return follower.vision;
+}
 
 /**
  * The panel's single long-lived connection to the service worker. One port carries both
@@ -113,6 +134,7 @@ export function usePanel(): PanelApi {
   const [scriptsStatus, setScriptsStatus] = useState<AreaStatus>('idle');
   const [scriptResult, setScriptResult] = useState<UserscriptRunResult | undefined>(undefined);
   const [scriptRunStatus, setScriptRunStatus] = useState<AreaStatus>('idle');
+  const [scriptSaved, setScriptSaved] = useState<WorkerToPanel['userscript.saved'] | undefined>(undefined);
 
   const [log, dispatch] = useReducer(runLogReducer, initialRunLogState);
   const [starting, setStarting] = useState(false);
@@ -198,6 +220,9 @@ export function usePanel(): PanelApi {
           setScriptResult(message.payload);
           setScriptRunStatus('ready');
           return;
+        case 'userscript.saved':
+          setScriptSaved(message.payload);
+          return;
         case 'error':
           setWorkerError(message.payload.message);
           return;
@@ -257,9 +282,13 @@ export function usePanel(): PanelApi {
       dispatch({ type: 'clear' });
       setWorkerError(undefined);
       setStarting(true);
-      send('run.start', { prompt, config });
+      // The worker refuses pixels/both for a known text-only Follower (M5 closes
+      // O-06); the catalog vision flag rides along so the guard can fire. Unknown
+      // (model absent from the fetched catalog) stays omitted, which refuses nothing.
+      const followerVision = followerVisionFor(models, config);
+      send('run.start', { prompt, config, ...(followerVision === undefined ? {} : { followerVision }) });
     },
-    [send],
+    [send, models],
   );
 
   const withRunId = useCallback(
@@ -284,6 +313,7 @@ export function usePanel(): PanelApi {
     scriptsStatus,
     scriptResult,
     scriptRunStatus,
+    scriptSaved,
     log,
     starting,
     refreshModels,
@@ -304,8 +334,21 @@ export function usePanel(): PanelApi {
     runScript: useCallback(
       (scriptId: string, code: string) => {
         setScriptResult(undefined);
+        setScriptSaved(undefined);
         setScriptRunStatus('waiting');
         send('userscript.run', { scriptId, code });
+      },
+      [send],
+    ),
+    stopScript: useCallback(() => {
+      send('userscript.stop', {});
+    }, [send]),
+    saveScriptResult: useCallback(
+      (value: unknown) => {
+        // The worker already holds this object from the run. The argument is what
+        // the panel test asserts; the message does not carry the body.
+        void value;
+        send('userscript.saveResult', { filename: 'userscript.json' });
       },
       [send],
     ),

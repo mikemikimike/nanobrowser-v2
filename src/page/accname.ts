@@ -97,12 +97,18 @@ const INPUT_TYPE_ROLE: Record<string, string> = {
   url: 'textbox',
 };
 
-/** `<input type=...>` values that behave as free-text fields (value is worth reporting). */
+/**
+ * `<input type=...>` values that behave as free-text fields (value is worth reporting).
+ *
+ * `password` is deliberately absent (R-12): the snapshot is sent to the model on every
+ * step and into the run log, so emitting a filled password's value would hand a
+ * credential to the provider and to disk. The node itself is still emitted — the agent
+ * needs to see the field to call `blocked` — only the value is withheld.
+ */
 export const TEXT_INPUT_TYPES = new Set([
   '',
   'email',
   'number',
-  'password',
   'search',
   'tel',
   'text',

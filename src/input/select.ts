@@ -4,6 +4,7 @@
  * tier is active underneath.
  */
 import type { InputFidelity } from '@/src/storage';
+import { jitterInBox } from './humanize';
 import type { ClickOptions, InputTier, PressOptions } from './types';
 import type { ElementRef, RefInputTier } from './inpage';
 
@@ -41,12 +42,7 @@ export async function refToPoint(
   ref: ElementRef,
   rng: () => number = Math.random,
 ): Promise<{ x: number; y: number }> {
-  const box = await getBox(ref);
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-  const jitterX = (rng() * 2 - 1) * (box.width / 2) * 0.35;
-  const jitterY = (rng() * 2 - 1) * (box.height / 2) * 0.35;
-  return { x: cx + jitterX, y: cy + jitterY };
+  return jitterInBox(await getBox(ref), rng);
 }
 
 function isRefTier(tier: RefInputTier | InputTier): tier is RefInputTier {

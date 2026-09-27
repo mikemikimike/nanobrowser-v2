@@ -14,11 +14,20 @@
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { BaseCheckpointSaver } from '@langchain/langgraph-checkpoint';
 import { startRun as defaultStartRun, type RunEndedEvent, type RunHandle } from '@/src/agent/run';
+import { validateObserveForVision } from '@/src/agent/grounding';
+import { stepsIn, type ReplayStore, type UserscriptValueStore } from './durability';
 import type { RunEvent, RunId, Userscript } from '@/src/messaging';
 import type { WriteUserscriptRequest } from '@/src/agent/tools';
 import type { Config, ModelSource } from '@/src/storage';
 import type { InputTier } from '@/src/input';
-import { listUserscripts, matchesAny, seedDefaults, writeAgentUserscript } from '@/src/userscripts';
+import {
+  listUserscripts,
+  matchesAny,
+  resolveUserscript,
+  seedDefaults,
+  setUserscriptProgressListener,
+  writeAgentUserscript,
+} from '@/src/userscripts';
 import type { AgentWriteResult } from '@/src/userscripts';
 import {
   EscalatableInput,
@@ -126,6 +135,18 @@ export interface RunManagerDeps {
   checkpointer?: BaseCheckpointSaver;
   /** Persists `session:lastRunId` so a reopened panel can replay (R-07). */
   saveLastRunId?: (runId: RunId) => Promise<void>;
+  /**
+   * Durable replay ring (M6): every published event is also saved here, so a
+   * panel reopened after a service-worker restart replays the partial log.
+   * Absent means memory only, as before.
+   */
+  replayStore?: ReplayStore;
+  /**
+   * Durable last-userscript value per run (M6): `save_file(fromLastUserscript:
+   * true)` after a restart reads this instead of failing obscurely. Absent
+   * means the value lives only in the run's closure, as before.
+   */
+  userscriptValueStoreFor?: (runId: RunId) => UserscriptValueStore | undefined;
   newRunId?: () => RunId;
   now?: () => number;
   /** Events kept per run for `runlog.replay`. */
@@ -141,6 +162,12 @@ export interface StartOptions {
   tabId?: number;
   /** Supplied by the dev trigger, which subscribes by run id. */
   runId?: RunId;
+  /**
+   * Whether the Follower model can see images. Absent means unknown (runs that
+   * predate the flag proceed as today); explicitly false plus `pixels`/`both`
+   * is refused rather than run blind (M5 closes O-06).
+   */
+  followerVision?: boolean;
 }
 
 export interface StartResult {
@@ -185,10 +212,23 @@ export class RunManager {
   readonly #deps: RunManagerDeps;
   readonly #listeners = new Set<(runId: RunId, event: RunEvent) => void>();
   readonly #ring = new Map<RunId, RunEvent[]>();
+  /** The tail of each run's persist chain. Deleted once the terminal event's save lands. */
+  readonly #persistTails = new Map<RunId, Promise<void>>();
   #active: ActiveRun | undefined;
 
   constructor(deps: RunManagerDeps) {
     this.#deps = deps;
+  }
+
+  /** The tab's URL now, so a navigate changes which scripts the list and the prompt show. */
+  async #liveUrl(tab: TargetTab): Promise<string> {
+    try {
+      const live = await this.#deps.tabs.get(tab.id);
+      if (live?.url) return live.url;
+    } catch {
+      // The tab closed. The URL from start is the last one we have.
+    }
+    return tab.url;
   }
 
   /** Subscribes to every event of every run. Returns an unsubscribe. */
@@ -204,6 +244,61 @@ export class RunManager {
   /** Buffered events for a run, oldest first (R-07's replay). */
   replay(runId: RunId): RunEvent[] {
     return [...(this.#ring.get(runId) ?? [])];
+  }
+
+  /**
+   * Rehydrates one run's replay buffer after a service-worker restart (M6).
+   * A no-op when the buffer is already in memory or nothing was persisted.
+   *
+   * A restored log with no terminal event is a run that died with the old
+   * worker: it gets one clean `run.ended{error}` naming the restart, published
+   * like any other event so the panel, the host log and the store agree, plus the
+   * `run.end` frame nb-run exits on (devRun's `end()` died with the old worker,
+   * so without this an unattended run would stream its terminal event and then
+   * hang). The alternative — silently resuming a graph against a tab that may
+   * have moved on — would be an invented continuation.
+   */
+  async restoreReplay(runId: RunId): Promise<void> {
+    if (this.#ring.has(runId)) return;
+    const stored = await this.#deps.replayStore?.load(runId).catch((error: unknown) => {
+      console.warn('[nanobrowser] could not load persisted replay', error);
+      return undefined;
+    });
+    if (!stored) return;
+    // Recheck after the await: two panels restoring the same run concurrently
+    // would otherwise each publish their own synthetic terminal event.
+    if (this.#ring.has(runId)) return;
+    this.#ring.set(runId, [...stored]);
+    const last = stored.at(-1);
+    const now = this.#deps.now ?? Date.now;
+    if (last?.kind === 'run.ended') {
+      // Finished before the restart — but devRun's run.end frame goes out after the
+      // terminal snapshot lands, so it may still have died with the old worker while
+      // nb-run waits. Re-emit it from the stored terminal: the trigger closes
+      // subscribers idempotently, and log readers last-win, so a duplicate only
+      // costs a log line while a missing frame hangs the client.
+      try {
+        this.#deps.host.appendRunLog(runId, {
+          type: 'run.end',
+          runId,
+          status: last.status,
+          message: last.message,
+          steps: last.steps,
+          at: now(),
+        });
+      } catch (error) {
+        console.warn('[nanobrowser] could not publish the restarted run end', error);
+      }
+      return;
+    }
+    const message = 'the extension restarted mid-run; showing the partial log up to the restart';
+    const steps = stepsIn(stored);
+    this.#publish(runId, { kind: 'run.ended', status: 'error', message, steps, at: now() });
+    try {
+      this.#deps.host.appendRunLog(runId, { type: 'run.end', runId, status: 'error', message, steps, at: now() });
+    } catch (error) {
+      console.warn('[nanobrowser] could not publish the restarted run end', error);
+    }
   }
 
   async start(options: StartOptions): Promise<StartResult> {
@@ -231,6 +326,9 @@ export class RunManager {
         'no model selected: choose a Leader model and a Follower model in the side panel',
       );
     }
+
+    const visionRefusal = validateObserveForVision(config.observe, options.followerVision);
+    if (visionRefusal) return this.#refuse(runId, visionRefusal);
 
     // Ordering guarantee: `run.started` is the first event of every run. Anything
     // emitted while the run is being assembled (e.g. `input.fidelity` from the
@@ -268,22 +366,30 @@ export class RunManager {
     });
 
     const host = this.#deps.host;
+    const userscriptValueStore = this.#deps.userscriptValueStoreFor?.(runId);
+    const readOnly = config.readOnly ?? false;
     const tools = createPageTools({
       tabId: tab.id,
       driver: this.#deps.driver,
       input,
       observe: config.observe,
       runUserscript: this.#deps.runUserscript,
-      listUserscripts: () => (this.#deps.listUserscriptCatalog ?? defaultListUserscriptsForAgent)(tab.url),
+      listUserscripts: async () =>
+        (this.#deps.listUserscriptCatalog ?? defaultListUserscriptsForAgent)(await this.#liveUrl(tab)),
+      // Whole-catalog resolution for the read-only preflight: unlike the display
+      // list above, it must see scripts matching wherever the run navigated to.
+      resolveUserscript,
       writeUserscript: this.#deps.writeUserscript ?? ((request) => writeAgentUserscript(request)),
       emit,
       runId,
+      ...(readOnly ? { readOnly } : {}),
+      ...(userscriptValueStore ? { userscriptValueStore } : {}),
       ...(host.saveArtifact ? { saveArtifact: (filename: string, content: string) => host.saveArtifact!(runId, filename, content) } : {}),
       ...(this.#deps.now ? { now: this.#deps.now } : {}),
     });
 
     const listAvailable = this.#deps.listAvailableUserscripts ?? defaultListAvailableUserscripts;
-    const availableUserscripts = await listAvailable(tab.url).catch((error: unknown) => {
+    const availableUserscripts = await listAvailable(await this.#liveUrl(tab)).catch((error: unknown) => {
       console.warn('[nanobrowser] could not list available userscripts', error);
       return [];
     });
@@ -305,6 +411,10 @@ export class RunManager {
       return this.#refuse(runId, `could not attach input to the tab: ${describe(error)}`);
     }
 
+    setUserscriptProgressListener((scriptId, line) => {
+      publish({ kind: 'userscript.output', scriptId, level: line.level, text: line.text, at: line.at });
+    });
+
     const start = this.#deps.start ?? defaultStartRun;
     const handle = start({
       prompt,
@@ -316,6 +426,7 @@ export class RunManager {
       tabId: tab.id,
       url: tab.url,
       availableUserscripts,
+      refreshUserscripts: async () => listAvailable(await this.#liveUrl(tab)),
       ...(this.#deps.checkpointer ? { checkpointer: this.#deps.checkpointer } : {}),
     });
 
@@ -335,10 +446,15 @@ export class RunManager {
         }),
       )
       .then(async (ended) => {
+        setUserscriptProgressListener(undefined);
         // R-13 hygiene: the escalated session is held for exactly one run.
         await input.detach().catch((error: unknown) => {
           console.warn('[nanobrowser] input detach failed', error);
         });
+        // Durability: done resolves only once the terminal snapshot has landed,
+        // so a worker restart right after success cannot restore a stale prefix
+        // and falsely mark the run interrupted.
+        await (this.#persistTails.get(runId) ?? Promise.resolve());
         if (this.#active?.runId === runId) this.#active = undefined;
         return ended;
       });
@@ -391,7 +507,8 @@ export class RunManager {
       at: now(),
     };
     this.#publish(runId, ended);
-    return { runId, ok: false, done: Promise.resolve(ended) };
+    // Refusals flush like completions: the terminal save must land before done.
+    return { runId, ok: false, done: (this.#persistTails.get(runId) ?? Promise.resolve()).then(() => ended) };
   }
 
   #publish(runId: RunId, event: RunEvent): void {
@@ -425,6 +542,26 @@ export class RunManager {
     }
     buffer.push(event);
     if (buffer.length > size) buffer.splice(0, buffer.length - size);
+    // Ordered fire-and-forget: each save waits for the run's previous one, so a slow
+    // store cannot land snapshots out of order and hide the tail behind a stale
+    // prefix after a restart. The snapshot is frozen here, at queue time — the buffer
+    // keeps growing while a gated save waits. The run never waits; a failed save only warns.
+    const snapshot = [...buffer];
+    const prev = this.#persistTails.get(runId) ?? Promise.resolve();
+    // The active run is exempt from durable eviction: refused starts persist
+    // terminal events too, so a burst of refusals behind a slow model call must
+    // not push the active run's keys out of the ring.
+    const protect = this.#active ? [this.#active.runId] : [];
+    const save = prev.catch(() => {}).then(() => this.#deps.replayStore?.save(runId, snapshot, { protect }));
+    const tail = save.catch((error: unknown) => {
+      console.warn('[nanobrowser] could not persist replay event', error);
+    });
+    this.#persistTails.set(runId, tail);
+    if (event.kind === 'run.ended') {
+      void tail.finally(() => {
+        if (this.#persistTails.get(runId) === tail) this.#persistTails.delete(runId);
+      });
+    }
   }
 }
 

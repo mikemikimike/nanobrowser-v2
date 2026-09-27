@@ -3,7 +3,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { EBAY_SEARCH_EXTRACT, HYPERAGENT_OBSERVE, I03_PAGE_ACCESS } from './examples';
+import { isReadOnlyScript } from '@/src/agent/policy';
+import { EBAY_RAM_COMPS, EBAY_SEARCH_EXTRACT, HYPERAGENT_OBSERVE, I03_PAGE_ACCESS } from './examples';
 import { matchesAny } from './match-pattern';
 import { resetWorldConfiguration, runUserscript } from './runner';
 import { vmUserScriptsApi } from './testing';
@@ -34,7 +35,7 @@ const THREAD_LIST = `
 `;
 
 const observe = {
-  id: 'hyperagent-observe',
+  id: HYPERAGENT_OBSERVE.id,
   name: HYPERAGENT_OBSERVE.name,
   matches: [...HYPERAGENT_OBSERVE.matches],
   code: HYPERAGENT_OBSERVE.code,
@@ -113,7 +114,7 @@ describe('bundled hyperagent-observe example', () => {
 });
 
 const ebaySearchExtract = {
-  id: 'ebay-search-extract',
+  id: EBAY_SEARCH_EXTRACT.id,
   name: EBAY_SEARCH_EXTRACT.name,
   matches: [...EBAY_SEARCH_EXTRACT.matches],
   code: EBAY_SEARCH_EXTRACT.code,
@@ -347,7 +348,7 @@ describe('bundled i03-page-access probe', () => {
   it('runs from the catalog entry and reports what the world reaches', async () => {
     const result = await runUserscript({
       tabId: 1,
-      script: { id: 'i03', ...I03_PAGE_ACCESS, updatedAt: 0 },
+      script: { ...I03_PAGE_ACCESS, updatedAt: 0 },
       url: 'https://hyperagent.com/threads',
       api: vmUserScriptsApi(),
     });
@@ -374,12 +375,134 @@ describe('bundled i03-page-access probe', () => {
     const before = document.body.innerHTML;
     const result = await runUserscript({
       tabId: 1,
-      script: { id: 'i03', ...I03_PAGE_ACCESS, updatedAt: 0 },
+      script: { ...I03_PAGE_ACCESS, updatedAt: 0 },
       url: 'https://hyperagent.com/threads',
       api: vmUserScriptsApi(),
     });
 
     expect(result.console).toEqual([]);
     expect(document.body.innerHTML).toBe(before);
+  });
+});
+
+describe('ebay-ram-comps seed', () => {
+  const ram = { ...EBAY_RAM_COMPS, updatedAt: 0 };
+
+  it('accepts the seed as a read-only script and leaves no button', () => {
+    expect(isReadOnlyScript(EBAY_RAM_COMPS.code).ok).toBe(true);
+    expect(EBAY_RAM_COMPS.code).not.toContain('.click(');
+    expect(EBAY_RAM_COMPS.code).not.toContain('download');
+  });
+
+  it('parses kit, lot, SODIMM, retail, and for-parts titles', async () => {
+    const result = await runUserscript({
+      tabId: 1,
+      script: ram,
+      url: 'https://www.ebay.com/sch/i.html',
+      args: {
+        titles: [
+          '32GB (4x8GB) DDR4 3200 RDIMM',
+          '4x 32GB DDR4 3200 RDIMM',
+          '32GB DDR4 3200 SODIMM',
+          '32GB DDR4 3200 compatible',
+          '32GB DDR4 3200 for parts',
+        ],
+      },
+      api: vmUserScriptsApi(),
+    });
+
+    expect(result.ok).toBe(true);
+    const rows = (result.value as { rows: Array<{ exclude: string | null; stick_gb: number | null; count: number; retail: boolean }> }).rows;
+    expect(rows[0]).toMatchObject({ stick_gb: 8, count: 4, exclude: null });
+    expect(rows[1]).toMatchObject({ stick_gb: 32, count: 4, exclude: null });
+    expect(rows[2]).toMatchObject({ exclude: 'laptop' });
+    expect(rows[3]).toMatchObject({ retail: true, exclude: null });
+    expect(rows[4]).toMatchObject({ exclude: 'junk' });
+  });
+
+  it('reads the price element when an earlier dollar amount is in the card', async () => {
+    const html = `<li class="s-card"><span class="s-card__title">32GB DDR4 3200 RDIMM</span><span>$1.00</span><span class="s-card__price">$40.00</span><a href="https://www.ebay.com/itm/1234567890">x</a></li>`;
+    const result = await runUserscript({
+      tabId: 1,
+      script: ram,
+      url: 'https://www.ebay.com/',
+      args: { html },
+      api: vmUserScriptsApi(),
+    });
+
+    expect(result.ok).toBe(true);
+    const value = result.value as { summary: unknown; rows: Array<{ price: number }> };
+    expect(value.summary).toEqual([]);
+    expect(value.rows[0]?.price).toBe(40);
+    expect(document.querySelector('button')).toBeNull();
+  });
+
+  it('summarises comparable listings by spec and leaves retail and excluded titles out', async () => {
+    const card = (id: string, title: string, price: string) =>
+      `<li class="s-card"><span class="s-card__title">${title}</span><span class="s-card__price">$${price}</span><a href="https://www.ebay.com/itm/${id}">x</a></li>`;
+    const html = [
+      card('1', '32GB DDR4 3200 RDIMM', '40.00'),
+      card('2', '32GB DDR4 3200 RDIMM Samsung', '60.00'),
+      card('3', '32GB DDR4 3200 compatible', '20.00'),
+      card('4', '32GB DDR4 3200 for parts', '5.00'),
+    ].join('');
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(html)) as typeof fetch;
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: ram,
+        url: 'https://www.ebay.com/',
+        args: { queries: ['32GB PC4-3200AA'], pages: 1 },
+        api: vmUserScriptsApi(),
+      });
+
+      expect(result.ok).toBe(true);
+      const value = result.value as { summary: Array<Record<string, unknown>>; rows: unknown[] };
+      expect(value.rows).toHaveLength(8);
+      expect(value.summary).toEqual([
+        { mode: 'bin', gen: 4, speed: 3200, stick_gb: 32, module: 'RDIMM', n: 2, median_per_stick: 50, min_per_stick: 40 },
+        { mode: 'sold', gen: 4, speed: 3200, stick_gb: 32, module: 'RDIMM', n: 2, median_per_stick: 50, min_per_stick: 40 },
+      ]);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it('treats limitQueries 0 as no queries rather than the full list', async () => {
+    const urls: string[] = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response('');
+    }) as typeof fetch;
+    try {
+      const result = await runUserscript({
+        tabId: 1,
+        script: ram,
+        url: 'https://www.ebay.com/',
+        args: { limitQueries: 0 },
+        api: vmUserScriptsApi(),
+      });
+      expect(result.ok).toBe(true);
+      expect(urls).toEqual([]);
+      expect((result.value as { rows: unknown[] }).rows).toEqual([]);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  it('refuses to run on a page that is not eBay before any fetch', async () => {
+    const api = vmUserScriptsApi();
+    const result = await runUserscript({
+      tabId: 1,
+      script: ram,
+      url: 'https://example.com/',
+      api,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('example.com');
+    expect(api.injections).toHaveLength(0);
   });
 });

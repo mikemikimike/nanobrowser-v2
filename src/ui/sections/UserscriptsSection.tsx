@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Userscript, UserscriptRunResult } from '@/src/messaging';
 import { Button } from '../components/Button';
 import { Card, Field, Section } from '../components/Card';
@@ -15,6 +15,9 @@ const BLANK = (): Userscript => ({
   updatedAt: Date.now(),
 });
 
+/** The side panel must not pretty-print a full comps dump. */
+const PREVIEW_CHARS = 4_000;
+
 const LEVEL_CLASS: Record<'log' | 'warn' | 'error', string> = {
   log: 'text-ink',
   warn: 'text-amber-700 dark:text-amber-300',
@@ -25,6 +28,12 @@ const LEVEL_CLASS: Record<'log' | 'warn' | 'error', string> = {
  * Execute and debug userscripts live (R-09/R-10). Run sends whatever is in the editor
  * right now — not the last saved copy — so edit-and-re-run needs no save step (O-03).
  */
+function cappedJson(value: unknown): string {
+  const full = prettyJson(value);
+  if (full.length <= PREVIEW_CHARS) return full;
+  return `${full.slice(0, PREVIEW_CHARS)}\n… preview truncated; Save JSON writes the full object`;
+}
+
 /** Match patterns are edited as free text; whitespace is only split when it is read. */
 function parseMatches(text: string): string[] {
   return text.split(/\s+/).filter(Boolean);
@@ -39,6 +48,9 @@ export function UserscriptsSection({
   onRun,
   onDelete,
   onRefresh,
+  onStop,
+  onSaveResult,
+  saved,
 }: {
   scripts: Userscript[];
   scriptsStatus: AreaStatus;
@@ -48,10 +60,14 @@ export function UserscriptsSection({
   onRun: (scriptId: string, code: string) => void;
   onDelete: (id: string) => void;
   onRefresh: () => void;
+  onStop?: () => void;
+  onSaveResult?: (value: unknown) => void;
+  saved?: { filename: string; path: string; bytes: number; note?: string };
 }) {
   const [draft, setDraft] = useState<Userscript>(BLANK);
   const [matchesText, setMatchesText] = useState(() => draft.matches.join(' '));
   const [dirty, setDirty] = useState(false);
+  const codeRef = useRef<HTMLTextAreaElement>(null);
 
   const load = (script: Userscript, asDirty: boolean) => {
     setDirty(asDirty);
@@ -72,6 +88,19 @@ export function UserscriptsSection({
     setDirty(true);
     setDraft((prev) => ({ ...prev, ...patch }));
   };
+
+  // The error line is already the user's line, with the wrapper offset removed.
+  useEffect(() => {
+    const match = result?.error?.match(/line (\d+)/);
+    const area = codeRef.current;
+    if (!match || !area) return;
+    const line = Number(match[1]);
+    // The newline that ends the previous line belongs before this line's first character.
+    const before = line > 1 ? draft.code.split('\n').slice(0, line - 1).join('\n').length + 1 : 0;
+    area.focus();
+    area.setSelectionRange(before, before);
+    area.scrollTop = (line - 1) * 16;
+  }, [result?.error, draft.code]);
 
   return (
     <div className="space-y-4">
@@ -146,6 +175,11 @@ export function UserscriptsSection({
             <Button variant="primary" onClick={() => onRun(draft.id, draft.code)}>
               Run
             </Button>
+            {onStop ? (
+              <Button variant="ghost" onClick={onStop}>
+                Stop
+              </Button>
+            ) : null}
           </span>
         }
         hint={dirty ? 'Unsaved — Run still uses exactly what is in the editor.' : undefined}
@@ -173,14 +207,24 @@ export function UserscriptsSection({
             </Field>
           </div>
           <Field label="Code" htmlFor="script-code">
-            <textarea
-              id="script-code"
-              rows={10}
-              spellCheck={false}
-              value={draft.code}
-              onChange={(event) => edit({ code: event.target.value })}
-              className="w-full resize-y rounded-md border border-line bg-paper px-2 py-1.5 font-mono text-xs leading-snug text-ink outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            />
+            <div className="flex overflow-hidden rounded-md border border-line">
+              <pre
+                aria-hidden="true"
+                data-testid="script-lines"
+                className="select-none bg-raised px-1.5 py-1.5 text-right font-mono text-xs leading-4 text-muted"
+              >
+                {draft.code.split('\n').map((_, index) => String(index + 1)).join('\n')}
+              </pre>
+              <textarea
+                id="script-code"
+                ref={codeRef}
+                rows={10}
+                spellCheck={false}
+                value={draft.code}
+                onChange={(event) => edit({ code: event.target.value })}
+                className="w-full resize-y bg-paper px-2 py-1.5 font-mono text-xs leading-4 text-ink outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              />
+            </div>
           </Field>
         </div>
       </Section>
@@ -212,10 +256,23 @@ export function UserscriptsSection({
               </pre>
             ) : null}
             <div>
-              <p className="text-[11px] font-semibold tracking-wide text-muted uppercase">Value</p>
-              <pre data-testid="script-value" className="mt-1 rounded bg-raised p-2 font-mono text-xs text-ink">
-                {prettyJson(result.value)}
+              <p className="flex items-center gap-2 text-[11px] font-semibold tracking-wide text-muted uppercase">
+                Value
+                {onSaveResult && result.value !== undefined ? (
+                  <Button variant="ghost" onClick={() => onSaveResult(result.value)}>
+                    Save JSON
+                  </Button>
+                ) : null}
+              </p>
+              <pre data-testid="script-value" className="mt-1 max-h-40 overflow-auto rounded bg-raised p-2 font-mono text-xs text-ink">
+                {cappedJson(result.value)}
               </pre>
+              {saved ? (
+                <p data-testid="script-saved" className="mt-1 text-xs text-muted">
+                  Saved {saved.filename} to <span className="font-mono">{saved.path}</span> ({saved.bytes} bytes)
+                  {saved.note ? `. ${saved.note}` : ''}
+                </p>
+              ) : null}
             </div>
             <div>
               <p className="text-[11px] font-semibold tracking-wide text-muted uppercase">Console</p>

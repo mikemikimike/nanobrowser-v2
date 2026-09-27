@@ -44,7 +44,7 @@ function messageHistory(): ReducedValue<BaseMessage[], unknown> {
 }
 
 export const AgentState = new StateSchema({
-  /** The planner's own transcript. Never sees raw page observations. */
+  /** The planner's own transcript. Sees the page only through its capped read tools. */
   leaderMessages: messageHistory(),
   /** The navigator's own transcript. Holds observations and tool results. */
   followerMessages: messageHistory(),
@@ -68,8 +68,30 @@ export const AgentState = new StateSchema({
    * graph can stop and say so rather than spending the whole step budget.
    */
   idleFollowerTurns: z.number().int().min(0).default(0),
+  /**
+   * Key of the most recent failed action (`name`, stable args, normalized error).
+   * Null when the last page-changing action succeeded or no action has failed yet.
+   */
+  repeatFailureKey: z.string().nullable().default(null),
+  /**
+   * Consecutive failures of `repeatFailureKey`.
+   *
+   * A model retrying a deterministically failing action burns the whole step budget
+   * reporting `max-steps` (seen live: the same refused `run_userscript` call retried
+   * verbatim, with prose turns in between, to exhaustion). Counted so the graph can
+   * stop and name the loop instead. Successful page reads do not reset this — looking
+   * at an unchanged page is not new information — but any successful page-changing
+   * action does.
+   */
+  repeatFailureTurns: z.number().int().min(0).default(0),
   lastSignal: FollowerSignalSchema.nullable().default(null),
   status: RunStatusSchema.default('running'),
+  /**
+   * Why an errored run stopped, in the run card's own words. Set alongside the
+   * error status (idle stall, repeat loop) so `run.ended.message` names the
+   * reason instead of the generic mapping. Null for every other outcome.
+   */
+  endNote: z.string().nullable().default(null),
 });
 
 export type AgentStateValue = typeof AgentState.State;
@@ -88,6 +110,8 @@ export const AgentContextSchema = z.object({
   maxSteps: z.number().int().min(1),
   /** R-08: the user's choice in the side panel. */
   observe: z.custom<ObserveMode>(),
+  /** M9 #13: read-only runs bind no acting tools and refuse them in depth. */
+  readOnly: z.boolean().default(false),
   leaderModel: z.custom<BaseChatModel>(),
   followerModel: z.custom<BaseChatModel>(),
   toolset: z.custom<PageToolset>(),
@@ -95,6 +119,8 @@ export const AgentContextSchema = z.object({
   /** Stored userscripts whose match pattern fits the run's tab (R-09), so the
    *  Follower knows what id(s) `run_userscript` may take. */
   availableUserscripts: z.array(z.object({ id: z.string(), name: z.string() })).default(() => []),
+  /** Re-reads the tab URL each Follower step so navigate updates the list. */
+  refreshUserscripts: z.custom<() => Promise<Array<{ id: string; name: string }>>>().optional(),
 });
 
 export type AgentContext = z.infer<typeof AgentContextSchema>;

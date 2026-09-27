@@ -25,6 +25,12 @@ export interface Config {
   planningInterval: number;
   maxSteps: number;
   inputFidelity: InputFidelity;
+  /**
+   * Read-only run mode (#13): navigation + reading + read-only userscripts, no
+   * writes. Absent means a full run — every config stored before this mode
+   * existed has no opinion here and must keep behaving exactly as before.
+   */
+  readOnly?: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -34,6 +40,7 @@ export const DEFAULT_CONFIG: Config = {
   planningInterval: 5,
   maxSteps: 50,
   inputFidelity: 'in-page',
+  readOnly: false,
 };
 
 export const configItem = storage.defineItem<Config>('local:config', {

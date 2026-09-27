@@ -16,7 +16,7 @@
  *    every test in this suite -- not because the USER_SCRIPT world leaks
  *    anything, but because the *test harness itself* is not the isolated world
  *    Chrome provides in production. That gap can't be closed here (same class
- *    of limitation as STATUS.md's R-02 "not proved against a real detector"
+ *    of limitation as R-02's standing "not proved against a real detector"
  *    caveat) -- so this file controls `globalThis.chrome` directly and proves
  *    the report-construction logic responds correctly to what it actually finds,
  *    which is the part a unit test *can* prove.

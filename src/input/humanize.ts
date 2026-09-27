@@ -14,6 +14,29 @@ export interface Point {
   y: number;
 }
 
+/** Anything with a viewport box: a DOMRect, a `Box`, a getBox result. */
+export interface BoxLike {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * A click point inside `box`: the centre plus a uniform offset of up to 35% of
+ * each half-extent — never dead-center (a bot tell per
+ * docs/research/trusted-input-and-stealth.md §4) and never outside the clickable
+ * area. Shared by the in-page tier (`src/page/actions.ts`) and the coordinate
+ * tiers (`refToPoint` below) so every tier aims the same way.
+ */
+export function jitterInBox(box: BoxLike, rng: Rng = Math.random): Point {
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const jitterX = (rng() * 2 - 1) * (box.width / 2) * 0.35;
+  const jitterY = (rng() * 2 - 1) * (box.height / 2) * 0.35;
+  return { x: cx + jitterX, y: cy + jitterY };
+}
+
 /** One planned pointer sample: a viewport point with a wall-clock offset in ms. */
 export interface PathPoint extends Point {
   /** Milliseconds since the first point (t=0 for the start point). */

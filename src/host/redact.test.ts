@@ -55,6 +55,30 @@ describe('redactEvent', () => {
     expect(redacted.result.summary).toBe('keys: [[redacted], [redacted]]');
   });
 
+  it('strips other providers sk- tokens, mirroring the host redactor', () => {
+    const event: RunEvent = {
+      kind: 'model.text',
+      role: 'follower',
+      text: 'key sk-abcDEF12345678901234567890 leaked',
+      at: 9,
+    };
+    const redacted = redactEvent(event);
+    if (redacted.kind !== 'model.text') throw new Error('expected model.text');
+    expect(redacted.text).toBe('key [redacted] leaked');
+  });
+
+  it('strips Doppler tokens', () => {
+    const event: RunEvent = {
+      kind: 'model.text',
+      role: 'follower',
+      text: 'token dp.ct.abcDEF1234567890 in output',
+      at: 10,
+    };
+    const redacted = redactEvent(event);
+    if (redacted.kind !== 'model.text') throw new Error('expected model.text');
+    expect(redacted.text).toBe('token [redacted] in output');
+  });
+
   it('leaves an event with nothing secret-shaped intact', () => {
     const event: RunEvent = { kind: 'step', n: 4, role: 'follower', at: 5 };
     expect(redactEvent(event)).toEqual(event);

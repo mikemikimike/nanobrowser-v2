@@ -1,6 +1,51 @@
 import { describe, expect, it } from 'vitest';
-import { planPath, sampleHold, sampleInterKey } from '@/src/input/humanize';
+import { jitterInBox, planPath, sampleHold, sampleInterKey } from '@/src/input/humanize';
 import { seededRng } from './support/rng';
+
+describe('jitterInBox', () => {
+  const box = { x: 100, y: 200, width: 80, height: 40 };
+
+  it('stays inside the box across many draws', () => {
+    const rng = seededRng(11);
+    for (let i = 0; i < 500; i++) {
+      const p = jitterInBox(box, rng);
+      expect(p.x).toBeGreaterThanOrEqual(box.x);
+      expect(p.x).toBeLessThanOrEqual(box.x + box.width);
+      expect(p.y).toBeGreaterThanOrEqual(box.y);
+      expect(p.y).toBeLessThanOrEqual(box.y + box.height);
+    }
+  });
+
+  it('never lands exactly on the center the old code always aimed at', () => {
+    const rng = seededRng(12);
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    let offCenter = 0;
+    for (let i = 0; i < 200; i++) {
+      const p = jitterInBox(box, rng);
+      if (p.x !== cx || p.y !== cy) offCenter += 1;
+    }
+    // Uniform over a non-degenerate range: every draw in practice misses center.
+    expect(offCenter).toBe(200);
+  });
+
+  it('stays within 35% of each half-extent around the center', () => {
+    const rng = seededRng(13);
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    for (let i = 0; i < 500; i++) {
+      const p = jitterInBox(box, rng);
+      expect(Math.abs(p.x - cx)).toBeLessThanOrEqual((box.width / 2) * 0.35 + 1e-9);
+      expect(Math.abs(p.y - cy)).toBeLessThanOrEqual((box.height / 2) * 0.35 + 1e-9);
+    }
+  });
+
+  it('is deterministic for a given seed', () => {
+    const a = jitterInBox(box, seededRng(42));
+    const b = jitterInBox(box, seededRng(42));
+    expect(a).toEqual(b);
+  });
+});
 
 describe('planPath (WindMouse)', () => {
   it('starts exactly at `from`', () => {

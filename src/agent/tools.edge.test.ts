@@ -41,6 +41,18 @@ describe('createPageToolset: schema validation rejects bad model output', () => 
     await expect(byName.get('click')!.invoke({ ref: 123 })).rejects.toThrow();
   });
 
+  it('hover rejects a missing ref', async () => {
+    const { byName } = toolset();
+    await expect(byName.get('hover')!.invoke({})).rejects.toThrow();
+  });
+
+  it('hover routes to the hover tool and reports what it hovered', async () => {
+    const { byName, page } = toolset();
+    const result = await byName.get('hover')!.invoke({ ref: 'e9' });
+    expect(String(result)).toContain('e9');
+    expect(page.calls).toContainEqual({ name: 'hover', args: ['e9'] });
+  });
+
   it('type rejects a missing text field', async () => {
     const { byName } = toolset();
     await expect(byName.get('type')!.invoke({ ref: 'e1' })).rejects.toThrow();
@@ -179,6 +191,8 @@ describe('createPageToolset: every valid call routes to the matching PageTools m
   it('routes every tool to its PageTools method exactly once, in order', async () => {
     const { byName, page } = toolset();
     await byName.get('click')!.invoke({ ref: 'e1' });
+    await byName.get('hover')!.invoke({ ref: 'e1b' });
+    await byName.get('get_box')!.invoke({ ref: 'e1c' });
     await byName.get('type')!.invoke({ ref: 'e2', text: 'hi' });
     await byName.get('press')!.invoke({ key: 'Enter' });
     await byName.get('scroll')!.invoke({ target: 'down' });
@@ -194,6 +208,8 @@ describe('createPageToolset: every valid call routes to the matching PageTools m
 
     expect(page.calls).toEqual([
       { name: 'click', args: ['e1'] },
+      { name: 'hover', args: ['e1b'] },
+      { name: 'getBox', args: ['e1c'] },
       { name: 'type', args: ['e2', 'hi'] },
       { name: 'press', args: ['Enter'] },
       { name: 'scroll', args: ['down'] },
@@ -215,6 +231,19 @@ describe('createPageToolset: every valid call routes to the matching PageTools m
     expect(all.map((t) => t.name).sort()).toEqual([...TOOL_NAMES].sort());
     expect(byName.size).toBe(TOOL_NAMES.length);
     for (const name of TOOL_NAMES) expect(byName.get(name)).toBeDefined();
+  });
+
+  it('a read-only toolset binds no acting tool', () => {
+    const { all, byName } = createPageToolset(new FakePageTools(), { readOnly: true });
+    expect(all.map((t) => t.name)).not.toContain('click');
+    for (const blocked of ['click', 'hover', 'type', 'press', 'select', 'download', 'write_userscript']) {
+      expect(byName.get(blocked)).toBeUndefined();
+    }
+    // Reads, navigation, the terminal tools, and the read-only userscript loop stay.
+    for (const kept of ['snapshot', 'screenshot', 'extract_text', 'get_box', 'scroll', 'navigate', 'run_userscript', 'list_userscripts', 'read_userscript', 'save_file', 'wait', 'done', 'blocked']) {
+      expect(byName.get(kept)).toBeDefined();
+    }
+    expect(byName.size).toBe(all.length);
   });
 });
 

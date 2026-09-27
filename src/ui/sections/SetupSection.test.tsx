@@ -64,6 +64,14 @@ describe('SetupSection config persistence', () => {
     );
   });
 
+  it('persists the read-only toggle (#13)', async () => {
+    const user = userEvent.setup();
+    setup();
+    expect((await getConfig()).readOnly).toBe(false);
+    await user.click(screen.getByRole('switch', { name: 'Read-only run' }));
+    await waitFor(async () => expect((await getConfig()).readOnly).toBe(true));
+  });
+
   it('restores a stored config on mount, so reopening the panel keeps the setup', async () => {
     await configItem.setValue({
       leaderModel: 'nvidia/nemotron-ultra',

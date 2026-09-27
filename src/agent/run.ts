@@ -19,7 +19,7 @@ import type { RunEvent, RunId } from '@/src/messaging/contract';
 import { buildAgentGraph } from './graph';
 import { IndexedDBSaver } from './checkpointer';
 import { createPageToolset, type PageTools } from './tools';
-import type { AgentContext, RunStatus } from './state';
+import type { RunStatus } from './state';
 
 export type RunEndedEvent = Extract<RunEvent, { kind: 'run.ended' }>;
 
@@ -46,6 +46,8 @@ export interface StartRunOptions {
   url?: string;
   /** Stored userscripts whose match pattern fits this tab (R-09). Default none. */
   availableUserscripts?: Array<{ id: string; name: string }>;
+  /** Re-reads the tab URL so a navigate changes which scripts the prompt lists. */
+  refreshUserscripts?: () => Promise<Array<{ id: string; name: string }>>;
 }
 
 export interface RunHandle {
@@ -92,19 +94,22 @@ export function startRun(options: StartRunOptions): RunHandle {
     tabId = -1,
     url = '',
     availableUserscripts = [],
+    refreshUserscripts,
   } = options;
 
   const graph = buildAgentGraph(checkpointer);
-  const context: AgentContext = {
+  const context = {
     objective: prompt,
     planningInterval: config.planningInterval,
     maxSteps: config.maxSteps,
     observe: config.observe,
+    readOnly: config.readOnly ?? false,
     leaderModel: models.leader,
     followerModel: models.follower,
-    toolset: createPageToolset(tools),
+    toolset: createPageToolset(tools, { readOnly: config.readOnly ?? false }),
     page: tools,
     availableUserscripts,
+    refreshUserscripts: refreshUserscripts ?? (async () => availableUserscripts),
   };
 
   const controller = new AbortController();
@@ -196,7 +201,7 @@ export function startRun(options: StartRunOptions): RunHandle {
       ended = {
         kind: 'run.ended',
         status,
-        message: ENDED_MESSAGE[status],
+        message: (snapshot.values.endNote as string | null) ?? ENDED_MESSAGE[status],
         steps: snapshot.values.stepCount ?? 0,
         at: Date.now(),
       };

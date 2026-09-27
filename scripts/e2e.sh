@@ -17,7 +17,15 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-DEFAULT_PROMPT="Read-only task. Look at the Threads sidebar on this Hyperagent page and report the titles and statuses of the 3 most recent threads. Do not create, send, edit, or delete anything; only click to reveal the list if it is collapsed. When you have the three titles and statuses, call done with them listed."
+DEFAULT_PROMPT='Read-only task. Look at the Threads sidebar on this Hyperagent page and report the titles and statuses of the 3 most recent threads. Do not create, send, edit, or delete anything; only click to reveal the list if it is collapsed. When you have the three titles and statuses, call done with a summary that is only a JSON array of exactly three objects, most recent first, each shaped {"title": "<thread title>", "status": "<thread status>"}, and no other text.'
+
+# What the default task's done summary must be: the three threads it asked for, each with
+# a nonempty title and status. A done status alone, or `[]`, `{}`, `null`, or rows missing
+# either field, is not the task's answer.
+THREADS_SCHEMA='type == "array" and length == 3
+  and all(.[]; type == "object"
+    and (.title | type == "string" and (gsub("\\s"; "") | length) > 0)
+    and (.status | type == "string" and (gsub("\\s"; "") | length) > 0))'
 
 PROMPT="${NB_E2E_PROMPT:-$DEFAULT_PROMPT}"
 URL="${NB_E2E_URL:-https://hyperagent.com}"
@@ -31,6 +39,9 @@ RELOAD_TIMEOUT="${NB_E2E_RELOAD_TIMEOUT:-30}"
 SKIP_BUILD="${NB_E2E_SKIP_BUILD:-0}"
 EXPECT="${NB_E2E_EXPECT:-done}"
 EXPECT_FILE="${NB_E2E_EXPECT_FILE:-}"
+EXPECT_RESULT="${NB_E2E_EXPECT_RESULT-__default__}"
+EXPECT_FILE_SCHEMA="${NB_E2E_EXPECT_FILE_SCHEMA:-}"
+STREAM_IN="${NB_E2E_STREAM:-}"
 
 usage() {
   cat <<'USAGE'
@@ -48,9 +59,18 @@ usage: scripts/e2e.sh [options]
   --skip-build           reuse .output/chrome-mv3 as it stands
   --expect <status>      run.ended status to require (default done; e.g. blocked)
   --expect-file <name>   require ~/.local/share/nanobrowser/artifacts/<runId>/<name> to exist
+                         (a .json file must also be nonempty: not null, "", [], or {})
+  --expect-result <jq>   jq filter the done summary, parsed as JSON, must satisfy
+                         (env NB_E2E_EXPECT_RESULT; default: three {title,status} rows for
+                         the default prompt, none for a custom prompt; "" disables)
+  --expect-file-schema <jq>
+                         jq filter the --expect-file JSON must satisfy (env NB_E2E_EXPECT_FILE_SCHEMA)
+  --stream <file>        verdict an existing run stream only: no build, reload, run, or
+                         extension-log check (env NB_E2E_STREAM)
   -h, --help
 
-Exit codes: 0 run ended with the expected status (default `done`) and no forwarded errors, 1 anything else.
+Exit codes: 0 run ended with the expected status (default `done`), a done run left the
+result it was asked for, and no forwarded errors; 1 anything else.
 USAGE
 }
 
@@ -68,6 +88,9 @@ while [ $# -gt 0 ]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --expect) EXPECT="$2"; shift 2 ;;
     --expect-file) EXPECT_FILE="$2"; shift 2 ;;
+    --expect-result) EXPECT_RESULT="$2"; shift 2 ;;
+    --expect-file-schema) EXPECT_FILE_SCHEMA="$2"; shift 2 ;;
+    --stream) STREAM_IN="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -75,14 +98,30 @@ done
 
 command -v jq >/dev/null || { echo "e2e: jq is required" >&2; exit 2; }
 
+if [ "$EXPECT_RESULT" = "__default__" ]; then
+  if [ "$PROMPT" = "$DEFAULT_PROMPT" ]; then EXPECT_RESULT="$THREADS_SCHEMA"; else EXPECT_RESULT=""; fi
+fi
+for filter in "$EXPECT_RESULT" "$EXPECT_FILE_SCHEMA"; do
+  [ -z "$filter" ] && continue
+  jq -n "$filter" >/dev/null 2>&1 </dev/null || [ $? -ne 3 ] \
+    || { echo "e2e: not a valid jq filter: $filter" >&2; exit 2; }
+done
+
+step() { printf '\n=== %s\n' "$1"; }
+
+if [ -n "$STREAM_IN" ]; then
+  [ -r "$STREAM_IN" ] || { echo "e2e: cannot read stream $STREAM_IN" >&2; exit 2; }
+  STREAM="$STREAM_IN"
+  RUN_RC=0
+  step "verdict only for $STREAM"
+else
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$ROOT/runs"
 STREAM="$ROOT/runs/e2e-$STAMP.jsonl"
 # The window ext.log errors are attributed to. Taken before the build, so an error
 # thrown while the reloaded worker starts up is inside it.
 SINCE="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-
-step() { printf '\n=== %s\n' "$1"; }
 
 # ---------------------------------------------------------------- 1. build
 if [ "$SKIP_BUILD" = "1" ]; then
@@ -136,6 +175,8 @@ host/bin/nb-run "$PROMPT" \
   >"$STREAM"
 RUN_RC=$?
 
+fi
+
 # ---------------------------------------------------------------- 5. verdict
 step "result"
 FAILED=0
@@ -178,6 +219,38 @@ else
   echo "(the agent never called done or blocked)"
 fi
 
+# satisfies <filter>: stdin must be JSON on which every output of <filter> is true, and
+# there is at least one. Bare `jq -e` passes a filter that emits nothing.
+satisfies() { jq -e "[ $1 ] | length > 0 and all" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- 5a. result shape
+# A done status is the agent's own claim. When the run was supposed to finish, the done
+# summary has to be the answer the task asked for.
+if [ "$EXPECT" = "done" ] && [ "$STATUS" = "done" ]; then
+  step "result shape"
+  DONE_SUMMARY="$(jq -rs '[.[] | select(.kind == "tool.call" and .call.name == "done")] | last | .call.args.summary // empty' "$STREAM" 2>/dev/null)"
+  if [ -z "${DONE_SUMMARY//[[:space:]]/}" ]; then
+    echo "e2e: the run ended done without a done summary" >&2
+    FAILED=1
+  elif [ -n "$EXPECT_RESULT" ]; then
+    # The summary itself, or failing that the outermost [...] or {...} in it, so a fenced
+    # or prefaced answer still parses. `null` parses too, and fails the filter.
+    RESULT="$(jq -cn --arg s "$DONE_SUMMARY" '
+      try ($s | fromjson)
+      catch (try ($s | capture("(?s)(?<j>\\[.*\\]|\\{.*\\})").j | fromjson) catch error("no JSON"))' 2>/dev/null)"
+    if [ -z "$RESULT" ]; then
+      echo "e2e: the done summary is not JSON; the task asked for a JSON result" >&2
+      FAILED=1
+    elif printf '%s' "$RESULT" | satisfies "$EXPECT_RESULT"; then
+      echo "done summary has the requested shape: $RESULT"
+    else
+      echo "e2e: the done summary does not have the requested shape: $RESULT" >&2
+      echo "     required: $(printf '%s' "$EXPECT_RESULT" | tr -s ' \n' ' ')" >&2
+      FAILED=1
+    fi
+  fi
+fi
+
 # ---------------------------------------------------------------- 5b. saved file
 if [ -n "$EXPECT_FILE" ]; then
   step "saved file"
@@ -186,9 +259,15 @@ if [ -n "$EXPECT_FILE" ]; then
   if [ -n "$RUN_ID" ] && [ -s "$ART" ]; then
     echo "$ART ($(wc -c <"$ART") bytes)"
     if [[ "$EXPECT_FILE" == *.json ]]; then
-      jq -e 'if type == "array" then length else 1 end' "$ART" >/dev/null 2>&1 \
-        && echo "valid JSON, $(jq -r 'if type == "array" then "\(length) items" else "object" end' "$ART")" \
-        || { echo "e2e: $ART is not valid JSON" >&2; FAILED=1; }
+      if ! jq . "$ART" >/dev/null 2>&1; then
+        echo "e2e: $ART is not valid JSON" >&2; FAILED=1
+      elif ! satisfies '. != null and . != "" and . != [] and . != {}' <"$ART"; then
+        echo "e2e: $ART is empty JSON ($(jq -c . "$ART"))" >&2; FAILED=1
+      elif [ -n "$EXPECT_FILE_SCHEMA" ] && ! satisfies "$EXPECT_FILE_SCHEMA" <"$ART"; then
+        echo "e2e: $ART does not satisfy the file schema: $EXPECT_FILE_SCHEMA" >&2; FAILED=1
+      else
+        echo "valid JSON, $(jq -r 'if type == "array" then "\(length) items" else type end' "$ART")"
+      fi
     fi
   else
     echo "e2e: expected artifact missing: $ART" >&2
@@ -198,8 +277,11 @@ fi
 
 # ---------------------------------------------------------------- 6. extension errors
 step "extension errors during this run"
-ERRORS="$(host/bin/nb-logs --since "$SINCE" --level error 2>/dev/null)"
-if [ -n "$ERRORS" ]; then
+ERRORS=""
+[ -z "$STREAM_IN" ] && ERRORS="$(host/bin/nb-logs --since "$SINCE" --level error 2>/dev/null)"
+if [ -n "$STREAM_IN" ]; then
+  echo "(not checked: --stream verdicts a saved run, and its log window is unknown)"
+elif [ -n "$ERRORS" ]; then
   echo "$ERRORS"
   # A run that "succeeded" while the worker was throwing is not a pass: the whole point
   # of forwarding is that these stop being invisible.

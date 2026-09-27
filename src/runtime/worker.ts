@@ -29,7 +29,9 @@ import {
 } from '@/src/messaging';
 import type { Config, InputFidelity, ModelSource, ObserveMode } from '@/src/storage';
 import type { ExtLogEntry } from './errorLog';
-import { handleUserscriptMessage as defaultHandleUserscript } from '@/src/userscripts';
+import { handleUserscriptMessage as defaultHandleUserscript, signalUserscriptStop } from '@/src/userscripts';
+import { userscriptArtifactBody } from './pageTools';
+import { sessionUserscriptValueStore } from './durability';
 import type { HostRunEndEvent, StartOptions, StartResult } from './runManager';
 
 /** Ten minutes: long enough that the panel never waits on the catalog twice, short enough to notice a new model. */
@@ -57,6 +59,7 @@ export interface HostPort {
   onRunAbort(handler: (msg: { runId: string }) => void): () => void;
   appendLog(entry: ExtLogEntry): void;
   onExtReload(handler: () => void): () => void;
+  saveArtifact?(runId: string, filename: string, content: string): Promise<{ path: string; bytes: number }>;
 }
 
 /** The slice of `RunManager` the worker uses. */
@@ -67,6 +70,8 @@ export interface RunManagerPort {
   resume(runId: RunId): boolean;
   abort(runId: RunId): boolean;
   replay(runId: RunId): RunEvent[];
+  /** Rehydrates one run's replay buffer from the durable store (M6). No-op when already in memory. */
+  restoreReplay(runId: RunId): Promise<void>;
   navigateActiveTab(url: string): Promise<void>;
   resolveTabId(): Promise<number | undefined>;
   readonly activeRunId: RunId | undefined;
@@ -77,6 +82,8 @@ export interface WorkerDeps {
   runManager: RunManagerPort;
   /** The panel's stored configuration, used by the dev trigger which sends none. */
   getConfig: () => Promise<Config>;
+  /** Last watched run id (`session:lastRunId`), restored once at worker startup. */
+  getLastRunId?: () => Promise<string | null>;
   handleUserscript?: typeof defaultHandleUserscript;
   extensionVersion?: string;
   modelsCacheMs?: number;
@@ -111,6 +118,8 @@ const PANEL_TYPES: ReadonlySet<string> = new Set<keyof PanelToWorker>([
   'userscript.list',
   'userscript.save',
   'userscript.delete',
+  'userscript.stop',
+  'userscript.saveResult',
   'runlog.replay',
   'log.append',
 ]);
@@ -156,6 +165,7 @@ export function applyRunOptions(config: Config, options?: Record<string, unknown
   if (Number.isInteger(interval) && interval > 0) next.planningInterval = interval;
   const maxSteps = Number(options.maxSteps);
   if (Number.isInteger(maxSteps) && maxSteps > 0) next.maxSteps = maxSteps;
+  if (typeof options.readOnly === 'boolean') next.readOnly = options.readOnly;
   return next;
 }
 
@@ -165,6 +175,9 @@ export function createWorker(deps: WorkerDeps): Worker {
   const cacheMs = deps.modelsCacheMs ?? MODELS_CACHE_MS;
   const panels = new Set<PanelChannel>();
   let modelsCache: { at: number; models: ModelInfo[] } | undefined;
+  // Each panel saves its own last result. One shared slot let a second panel's run
+  // replace the value between the first panel's Run and its Save JSON.
+  const panelUserscriptValues = new WeakMap<PanelChannel, unknown>();
 
   const broadcast = <K extends keyof WorkerToPanel>(type: K, payload: WorkerToPanel[K]): void => {
     for (const channel of [...panels]) channel.send(type, payload);
@@ -212,7 +225,7 @@ export function createWorker(deps: WorkerDeps): Worker {
     switch (message.type) {
       case 'run.start': {
         const { prompt, config } = message.payload;
-        await deps.runManager.start({ prompt, config });
+        await deps.runManager.start({ prompt, config, followerVision: message.payload.followerVision });
         return;
       }
       case 'run.pause':
@@ -232,6 +245,10 @@ export function createWorker(deps: WorkerDeps): Worker {
         return;
       case 'runlog.replay': {
         const { runId } = message.payload;
+        // After a service-worker restart the buffer lives only in the durable
+        // store (M6): restore first so the reopened panel replays the partial
+        // log instead of an empty one.
+        await deps.runManager.restoreReplay(runId);
         reply(channel, { type: 'runlog.replay', payload: { runId, events: deps.runManager.replay(runId) } });
         return;
       }
@@ -239,6 +256,44 @@ export function createWorker(deps: WorkerDeps): Worker {
         // The panel has no native port; the worker is its only route to ext.log.
         deps.host.appendLog(message.payload);
         return;
+      case 'userscript.stop': {
+        const tabId = await deps.runManager.resolveTabId();
+        if (tabId === undefined) {
+          reply(channel, { type: 'error', payload: { message: 'no target tab', inReplyTo: 'userscript.stop' } });
+          return;
+        }
+        await signalUserscriptStop(tabId);
+        return;
+      }
+      case 'userscript.saveResult': {
+        if (!panelUserscriptValues.has(channel)) {
+          reply(channel, {
+            type: 'error',
+            payload: { message: 'no userscript result to save', inReplyTo: 'userscript.saveResult' },
+          });
+          return;
+        }
+        if (!deps.host.saveArtifact) {
+          reply(channel, {
+            type: 'error',
+            payload: { message: 'the host cannot save a file', inReplyTo: 'userscript.saveResult' },
+          });
+          return;
+        }
+        const packed = userscriptArtifactBody(panelUserscriptValues.get(channel));
+        const filename = message.payload.filename || 'userscript.json';
+        const artifact = await deps.host.saveArtifact('panel', filename, packed.body);
+        reply(channel, {
+          type: 'userscript.saved',
+          payload: {
+            filename,
+            path: artifact.path,
+            bytes: artifact.bytes,
+            ...(packed.droppedRows ? { note: 'rows exceeded 8 MiB and were left out; summary and log were saved' } : {}),
+          },
+        });
+        return;
+      }
       case 'userscript.run':
       case 'userscript.list':
       case 'userscript.save':
@@ -251,6 +306,16 @@ export function createWorker(deps: WorkerDeps): Worker {
             ? { emit: (event: RunEvent) => broadcast('run.event', { runId: activeRunId, event }) }
             : {}),
         });
+        if (result?.type === 'userscript.result' && result.payload.value !== undefined) {
+          panelUserscriptValues.set(channel, result.payload.value);
+          if (activeRunId) {
+            void sessionUserscriptValueStore(activeRunId)
+              ?.save(result.payload.value)
+              .catch((error: unknown) => {
+                console.warn('[nanobrowser] could not persist the panel userscript value', error);
+              });
+          }
+        }
         if (result) reply(channel, result);
         return;
       }
@@ -321,6 +386,9 @@ export function createWorker(deps: WorkerDeps): Worker {
     }
 
     try {
+      // nb-run sends no vision metadata, so followerVision stays unknown (allowed):
+      // the pixels/text-only refusal only fires on the panel path, which looks the
+      // follower up in its fetched catalog. A dev-trigger vision option is future work.
       const { done } = await deps.runManager.start({ prompt: msg.prompt, config, runId: msg.runId });
       const ended = await done;
       end(ended.status, ended.message, ended.steps);
@@ -364,6 +432,19 @@ export function createWorker(deps: WorkerDeps): Worker {
       });
     }
   });
+
+  // A restart mid-run must terminate the run even when no panel ever reopens:
+  // restore the last watched run once, so an unattended dev/CLI run gets its
+  // clean terminal event and nb-run its run.end instead of hanging. Best effort;
+  // a missing id or store simply means there is nothing to restore.
+  if (deps.getLastRunId) {
+    const getLastRunId = deps.getLastRunId;
+    void getLastRunId()
+      .then((runId) => (runId ? deps.runManager.restoreReplay(runId) : undefined))
+      .catch((error: unknown) => {
+        console.warn('[nanobrowser] could not restore the last run at startup', error);
+      });
+  }
 
   return {
     connect,

@@ -27,7 +27,8 @@ after asking.
 ## Requirements
 
 `REQUIREMENTS.md` is canonical and written from the user's own words. Never edit, reword,
-extend or reinterpret it. Findings go in `docs/research/`; status goes in `docs/STATUS.md`.
+extend or reinterpret it. Findings go in `docs/research/`; open work and status go in
+GitHub issues, and proof goes in test names, not in a status doc.
 
 Distinguish a **requirement** (a measure of success) from a **constraint** (comply, but
 choose how). When something is genuinely unknown, write it down as a question to

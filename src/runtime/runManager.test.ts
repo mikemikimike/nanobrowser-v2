@@ -21,6 +21,7 @@ import {
   type TabsPort,
 } from './runManager';
 import type { RuntimeDriver } from './pageTools';
+import { memoryStores, type ReplayStore } from './durability';
 
 const config: Config = {
   leaderModel: 'fake/leader',
@@ -152,6 +153,179 @@ describe('RunManager.start', () => {
       await runManager.start({ prompt: 'go', config: { ...config, followerModel: '' } })
     ).done;
     expect(ended.message).toContain('choose a Leader model');
+  });
+
+  it('refuses pixels mode for a known text-only follower instead of running blind (O-06)', async () => {
+    const { runManager } = manager();
+    const ended = await (
+      await runManager.start({
+        prompt: 'go',
+        config: { ...config, observe: 'pixels' },
+        followerVision: false,
+      })
+    ).done;
+    expect(ended.status).toBe('error');
+    expect(ended.message).toContain('observe mode "pixels"');
+  });
+
+  it('starts pixels mode when follower vision is unknown or present', async () => {
+    const scripted = scriptedStart([], endedOk);
+    for (const followerVision of [undefined, true] as const) {
+      const { runManager } = manager({ start: scripted.start });
+      const result = await runManager.start({
+        prompt: 'go',
+        config: { ...config, observe: 'pixels' },
+        ...(followerVision === undefined ? {} : { followerVision }),
+      });
+      expect(result.ok).toBe(true);
+      scripted.finish();
+      await result.done;
+    }
+  });
+});
+
+describe('RunManager.restoreReplay (M6)', () => {
+  const step: RunEvent = { kind: 'step', n: 3, role: 'follower', at: 2 };
+  const started: RunEvent = {
+    kind: 'run.started',
+    runId: 'run-1',
+    prompt: 'go',
+    config,
+    tabId: 3,
+    url: 'https://example.test/',
+    at: 1,
+  };
+
+  it('persists published events so a new instance replays the finished run', async () => {
+    const stores = memoryStores();
+    const scripted = scriptedStart([step], endedOk);
+    const first = manager({ start: scripted.start, replayStore: stores.replay });
+    const result = await first.runManager.start({ prompt: 'go', config });
+    expect(result.ok).toBe(true);
+    scripted.finish();
+    await result.done;
+    // Let the fire-and-forget saves land.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const second = manager({ replayStore: stores.replay });
+    expect(second.runManager.replay('run-1')).toEqual([]);
+    await second.runManager.restoreReplay('run-1');
+    // The terminal event was persisted too, so no synthetic ending is added.
+    expect(second.runManager.replay('run-1')).toEqual(first.runManager.replay('run-1'));
+    expect(second.runManager.replay('run-1').at(-1)).toEqual(endedOk);
+  });
+
+  it('lands replay snapshots in order even when an early save resolves late', async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const landed: RunEvent[][] = [];
+    let calls = 0;
+    const store: ReplayStore = {
+      load: async () => undefined,
+      save: async (_runId, events) => {
+        calls += 1;
+        // The first save hangs until released below; later saves queue behind it.
+        if (calls === 1) await firstGate;
+        landed.push(events);
+      },
+    };
+    const scripted = scriptedStart([step], endedOk);
+    const { runManager } = manager({ start: scripted.start, replayStore: store });
+    const result = await runManager.start({ prompt: 'go', config });
+    expect(result.ok).toBe(true);
+    scripted.finish();
+    const doneP = result.done;
+    let doneResolved = false;
+    void doneP.then(() => {
+      doneResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The run itself never waits for persistence (event flow is unblocked)...
+    expect(calls).toBeGreaterThan(0);
+    // ...but done does: it resolves only once the terminal snapshot has landed.
+    expect(doneResolved).toBe(false);
+    releaseFirst();
+    const ended = await doneP;
+    expect(doneResolved).toBe(true);
+    expect(ended.status).toBe('done');
+
+    // Every landed snapshot extends the previous one; the stale gated prefix never
+    // overwrote the full buffer behind it — and the last one is terminal.
+    expect(landed.length).toBeGreaterThan(1);
+    for (let i = 1; i < landed.length; i++) {
+      expect(landed[i]!.length).toBeGreaterThan(landed[i - 1]!.length);
+      expect(landed[i]!.slice(0, landed[i - 1]!.length)).toEqual(landed[i - 1]);
+    }
+    expect(landed.at(-1)?.at(-1)).toMatchObject({ kind: 'run.ended', status: 'done' });
+  });
+
+  it('ends an interrupted restored run with a clean error, keeping the partial log', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-1', [started, step]);
+
+    const { runManager, events, hostLog } = manager({ replayStore: stores.replay, now: () => 99 });
+    await runManager.restoreReplay('run-1');
+
+    const replayed = runManager.replay('run-1');
+    expect(replayed.map((e) => e.kind)).toEqual(['run.started', 'step', 'run.ended']);
+    expect(replayed.at(-1)).toMatchObject({
+      kind: 'run.ended',
+      status: 'error',
+      steps: 3,
+      at: 99,
+    });
+    expect((replayed.at(-1) as { message: string }).message).toContain('restarted');
+    // Published like any other event: panels, host log and store agree.
+    expect(events.at(-1)).toEqual(['run-1', replayed.at(-1)]);
+    expect(hostLog.at(-2)).toEqual(['run-1', replayed.at(-1)]);
+    // Plus the run.end frame nb-run exits on: devRun's end() died with the worker.
+    expect(hostLog.at(-1)?.[0]).toBe('run-1');
+    expect(hostLog.at(-1)?.[1]).toMatchObject({ type: 'run.end', status: 'error', steps: 3 });
+    expect((hostLog.at(-1)?.[1] as { message: string }).message).toContain('restarted');
+  });
+
+  it('publishes one terminal event when two restores race on the same run', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-1', [started, step]);
+
+    const { runManager } = manager({ replayStore: stores.replay, now: () => 99 });
+    await Promise.all([runManager.restoreReplay('run-1'), runManager.restoreReplay('run-1')]);
+
+    expect(runManager.replay('run-1').map((e) => e.kind)).toEqual(['run.started', 'step', 'run.ended']);
+  });
+
+  it('re-emits run.end for a finished restore, so a lost terminator never hangs nb-run', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-1', [started, step, endedOk]);
+
+    const { runManager, hostLog } = manager({ replayStore: stores.replay, now: () => 99 });
+    await runManager.restoreReplay('run-1');
+
+    // No synthetic run.ended (the log already ends)...
+    expect(runManager.replay('run-1').at(-1)).toEqual(endedOk);
+    // ...but the terminator goes out again, mirroring the stored terminal: it is
+    // sent after the terminal snapshot lands, so it may have died with the worker.
+    expect(hostLog.at(-1)).toEqual([
+      'run-1',
+      { type: 'run.end', runId: 'run-1', status: 'done', message: 'objective complete', steps: 2, at: 99 },
+    ]);
+  });
+
+  it('restoreReplay is a no-op for buffered runs, finished restores, and unknown runs', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-1', [started, step]);
+    const { runManager } = manager({ replayStore: stores.replay, now: () => 99 });
+
+    await runManager.restoreReplay('missing');
+    expect(runManager.replay('missing')).toEqual([]);
+
+    await runManager.restoreReplay('run-1');
+    expect(runManager.replay('run-1')).toHaveLength(3);
+    // Second restore hits the memory buffer: no duplicate terminal event.
+    await runManager.restoreReplay('run-1');
+    expect(runManager.replay('run-1')).toHaveLength(3);
   });
 
   it('acts on the active tab of the last focused window and names it in run.started (R-01)', async () => {
@@ -306,6 +480,32 @@ describe('RunManager.start', () => {
 
     expect(listAvailableUserscripts).toHaveBeenCalledWith('https://www.ebay.com/sch/i.html?_nkw=ddr5');
     expect(scripted.seen[0]?.availableUserscripts).toEqual([{ id: 's1', name: 'ebay-search-extract' }]);
+  });
+
+  it('lists ebay-ram-comps after the tab moves from the eBay homepage onto a search', async () => {
+    fakeBrowser.reset();
+    let url = 'https://www.ebay.com/';
+    const scripted = scriptedStart([], endedOk);
+    const { runManager } = manager({
+      start: scripted.start,
+      tabs: {
+        activeTab: async () => ({ id: 3, url }),
+        get: async () => ({ id: 3, url }),
+      },
+    });
+    await runManager.start({ prompt: 'go', config });
+    const tools = scripted.seen[0]?.tools;
+    expect(tools).toBeDefined();
+
+    const home = await tools!.listUserscripts();
+    expect(home).toContain('ebay-ram-comps');
+    expect(home).not.toContain('ebay-search-extract');
+
+    url = 'https://www.ebay.com/sch/i.html?_nkw=ddr5';
+    const search = await tools!.listUserscripts();
+    expect(search).toContain('ebay-ram-comps');
+    expect(search).toContain('ebay-search-extract');
+    scripted.finish();
   });
 
   it('surfaces the bundled ebay-search-extract userscript on an eBay search page by default', async () => {

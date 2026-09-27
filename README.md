@@ -8,8 +8,9 @@ Two models cooperate: a **Leader** that plans and never touches the page, and a
 and can pause, resume or abort at any point.
 
 `REQUIREMENTS.md` is the canonical statement of what this must do. It is written from the
-user's own words and is never edited by an agent. `docs/STATUS.md` maps every requirement
-to the file that implements it and the test that proves it.
+user's own words and is never edited by an agent. Proof lives in the tests themselves:
+test names are sentences describing the behaviour being proved, and open work lives in
+GitHub issues.
 
 ---
 
@@ -56,7 +57,16 @@ actionable element gets a `[ref=eNN]` handle, and performs clicks and typing.
 Separately from all of that, the agent can **write a userscript and iterate on it**: author
 the code, run it in the `USER_SCRIPT` world, read what it returned and what it logged, and
 fix it. Scripts it writes must name a concrete http/https host — never every site — and it
-can never overwrite one you wrote; the panel marks the ones it did write. This needs
+can never overwrite one you wrote; the panel marks the ones it did write. It reads a script's
+source with `read_userscript` before changing it, and can pass `args` to `run_userscript` to
+shorten a long run. A run streams its console lines into the run log as it goes, gives up
+after 120 s, and polls a stop flag that the panel's Stop button sets. A run that is stopped,
+times out, or hits a challenge page hands back the partial rows it had. The model sees only a
+result's `summary`, `meta` and `log`. Rows go to disk through `save_file`, and the panel's Save
+JSON writes its last result under `artifacts/panel/`. The bundled `ebay-ram-comps` script is
+the only bundled script that makes requests: same-origin GETs of eBay search pages, sent with
+your session. A read-only run skips the write scan only for a bundled script whose code is
+exactly as shipped. Once you edit a bundled script it is scanned like any other. This needs
 **Allow User Scripts** turned on for the extension at `chrome://extensions`, which is off by
 default and only you can turn on.
 
@@ -157,7 +167,6 @@ bash scripts/check-invariants.sh
 | Path | What |
 |---|---|
 | `REQUIREMENTS.md` | canonical requirements, never edited by an agent |
-| `docs/STATUS.md` | every requirement → file → proving test |
 | `docs/host-protocol.md` | the native messaging wire protocol |
 | `docs/research/` | the findings the design rests on |
 | `src/agent/` | LangGraph graph, tools, state, checkpointer, model handles |

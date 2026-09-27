@@ -14,11 +14,19 @@ import { createChromeDebuggerApi, DebuggerInputTier } from '@/src/input';
 import { HostClient, createHostFetch } from '@/src/host';
 import { PageDriver } from '@/src/page';
 import { getConfig } from '@/src/storage';
-import { getUserscript, runUserscript, seedDefaults } from '@/src/userscripts';
+import { notifyUserscriptProgress, resolveUserscript, runUserscript, seedDefaults } from '@/src/userscripts';
 import { RunManager, chromeTabsPort, createWorker, installErrorForwarding } from '@/src/runtime';
-import { setLastRunId } from '@/src/ui/state/lastRun';
+import { sessionReplayStore, sessionUserscriptValueStore } from '@/src/runtime/durability';
+import { getLastRunId, setLastRunId } from '@/src/ui/state/lastRun';
 
 export default defineBackground(() => {
+  // Chrome does not start an MV3 service worker on browser launch unless the worker
+  // registered a startup listener the last time it ran. Without this, a Chrome restart
+  // leaves the worker inactive, so connectNative never runs and the host never exists
+  // for nb-run / e2e. The listener body can be empty; registration is the wake.
+  // https://groups.google.com/a/chromium.org/g/chromium-extensions/c/XY6u0raKRJQ
+  chrome.runtime.onStartup.addListener(() => {});
+
   // The toolbar action opens the side panel (R-05). Chrome 114+, needs the sidePanel permission.
   void chrome.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: true })
@@ -45,6 +53,8 @@ export default defineBackground(() => {
   host.connect();
   const hostFetch = createHostFetch(host);
   const driver = new PageDriver();
+  // M6 durability, resolved once: undefined outside the extension (tests, dev).
+  const replayStore = sessionReplayStore();
 
   const runManager = new RunManager({
     driver,
@@ -55,21 +65,37 @@ export default defineBackground(() => {
     // URL/credential; createChatModel defaults it to OpenRouter when absent.
     createModel: (model, source) => createChatModel({ model, source, fetch: hostFetch }),
     makeDebuggerTier: (onDetach) => new DebuggerInputTier(createChromeDebuggerApi(), { onDetach }),
-    runUserscript: async (scriptId, tabId) => {
-      const script = await getUserscript(scriptId);
+    runUserscript: async (scriptId, tabId, args) => {
+      // `resolveUserscript` tolerates the script's name: weak Followers echo the
+      // parenthesized name from the per-turn prompt instead of the id (seen live
+      // with ebay-search-extract). Unambiguous names run; anything else errors.
+      const script = await resolveUserscript(scriptId);
       if (!script) {
         return { scriptId, ok: false, error: `unknown userscript: ${scriptId}`, console: [], durationMs: 0 };
       }
-      return runUserscript({ tabId, script });
+      // Agent runs stream console lines into the run log; panel runs do not.
+      return runUserscript({ tabId, script, reportProgress: true, ...(args ? { args } : {}) });
     },
     saveLastRunId: setLastRunId,
+    // M6: the replay ring and the last-userscript value survive a worker
+    // restart in chrome.storage.session. Undefined outside the extension.
+    ...(replayStore ? { replayStore } : {}),
+    userscriptValueStoreFor: (runId) => sessionUserscriptValueStore(runId),
   });
 
   const worker = createWorker({
     host,
     runManager,
     getConfig,
+    getLastRunId,
     extensionVersion: chrome.runtime.getManifest().version,
+  });
+
+  const runtime = chrome.runtime as typeof chrome.runtime & {
+    onUserScriptMessage?: { addListener(cb: (message: { type?: string; level?: unknown; text?: unknown; at?: unknown }) => void): void };
+  };
+  runtime.onUserScriptMessage?.addListener((message) => {
+    if (message?.type === 'nanobrowser.userscript.progress') notifyUserscriptProgress(message);
   });
 
   chrome.runtime.onConnect.addListener((port) => {

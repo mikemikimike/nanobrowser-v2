@@ -217,6 +217,26 @@ export function SetupSection({
         </div>
       </Section>
 
+      <Section title="Run policy">
+        <div className="flex items-start gap-2">
+          <Toggle
+            id="read-only"
+            label="Read-only run"
+            checked={config.readOnly ?? false}
+            onChange={(on) => update({ readOnly: on })}
+          />
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-ink">
+              {config.readOnly ? 'Read-only: no clicks, typing, or downloads' : 'Full run'}
+            </p>
+            <p className="text-xs leading-snug text-muted">
+              Read-only runs navigate, read, run read-only userscripts, and save — acting
+              tools are hidden from the agent and refused by the runtime.
+            </p>
+          </div>
+        </div>
+      </Section>
+
       <div className="border-t border-line pt-3">
         <Button variant="ghost" onClick={reset}>
           Reset to defaults

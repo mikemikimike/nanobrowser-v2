@@ -155,7 +155,7 @@ export async function writeAgentUserscript(
       // destroy work with no record of what it used to be.
       errors.push(
         `${request.scriptId} ("${existing.name}") was written by the user and cannot be ` +
-          'overwritten. Omit scriptId to create your own script instead.',
+          'overwritten. Omit scriptId to create a copy of your own.',
       );
     } else {
       created = false;

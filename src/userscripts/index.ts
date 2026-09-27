@@ -17,6 +17,7 @@ export * from './i03';
 
 import type { PanelToWorkerMessage, RunEvent, WorkerToPanelMessage } from '@/src/messaging';
 import { deleteUserscript, getUserscript, listUserscripts, saveUserscript, seedDefaults } from './catalog';
+import { applyUserscriptHeader } from './metadata';
 import { DebugSession, toRunEvents } from './debug';
 import { runUserscript, type AvailabilityEnv, type TabsApi, type UserScriptsApi } from './runner';
 
@@ -69,7 +70,7 @@ export async function handleUserscriptMessage(
         // including one the agent wrote and the user then edited. Without this the
         // `author: 'agent'` stamp survived the user's own edit, and the agent could
         // overwrite work the user had put into it.
-        await saveUserscript({ ...message.payload, author: undefined }, context.now);
+        await saveUserscript(applyUserscriptHeader({ ...message.payload, author: undefined }), context.now);
       } catch (error) {
         return errorReply(describe(error), 'userscript.save');
       }

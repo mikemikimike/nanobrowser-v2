@@ -53,7 +53,7 @@ function instantSleep() {
 }
 
 describe('DebuggerInputTier: click', () => {
-  it('dispatches mouseMoved -> mousePressed (force 0.5) -> mouseReleased, holding 40-120ms', async () => {
+  it('arrives along the humanized path, then mousePressed (force 0.5) -> mouseReleased, holding 40-120ms', async () => {
     const fake = createFakeDebuggerApi();
     const { sleep, waits } = instantSleep();
     const tier = new DebuggerInputTier(fake.api, { rng: seededRng(1), sleep });
@@ -61,22 +61,34 @@ describe('DebuggerInputTier: click', () => {
     await tier.attach(7);
     await tier.click(100, 200, { button: 'left', clickCount: 1 });
 
-    expect(fake.calls).toEqual([
-      { method: 'Input.dispatchMouseEvent', target: { tabId: 7 }, params: { type: 'mouseMoved', x: 100, y: 200, button: 'none', buttons: 0 } },
-      {
-        method: 'Input.dispatchMouseEvent',
-        target: { tabId: 7 },
-        params: { type: 'mousePressed', x: 100, y: 200, button: 'left', buttons: 1, clickCount: 1, force: 0.5 },
-      },
-      {
-        method: 'Input.dispatchMouseEvent',
-        target: { tabId: 7 },
-        params: { type: 'mouseReleased', x: 100, y: 200, button: 'left', buttons: 0, clickCount: 1 },
-      },
-    ]);
-    expect(waits).toHaveLength(1);
-    expect(waits[0]).toBeGreaterThanOrEqual(40);
-    expect(waits[0]).toBeLessThanOrEqual(120);
+    const moves = fake.calls.filter(c => c.params?.type === 'mouseMoved');
+    const pressed = fake.calls.filter(c => c.params?.type === 'mousePressed');
+    const released = fake.calls.filter(c => c.params?.type === 'mouseReleased');
+    // One arrival path (no teleport straight to the target), then exactly one press/release.
+    expect(moves.length).toBeGreaterThan(1);
+    expect(pressed).toHaveLength(1);
+    expect(released).toHaveLength(1);
+    expect(moves.at(-1)?.params).toMatchObject({ x: 100, y: 200, button: 'none', buttons: 0 });
+    expect(pressed[0]?.params).toMatchObject({
+      type: 'mousePressed',
+      x: 100,
+      y: 200,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+      force: 0.5,
+    });
+    expect(released[0]?.params).toMatchObject({
+      type: 'mouseReleased',
+      x: 100,
+      y: 200,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    // The last sleep is the press hold (path pacing comes before it).
+    expect(waits.at(-1)).toBeGreaterThanOrEqual(40);
+    expect(waits.at(-1)).toBeLessThanOrEqual(120);
   });
 
   it('maps right/middle buttons and a triple clickCount', async () => {
@@ -87,6 +99,21 @@ describe('DebuggerInputTier: click', () => {
     await tier.click(1, 1, { button: 'right', clickCount: 3 });
     const pressed = fake.calls.find(c => c.params?.type === 'mousePressed');
     expect(pressed?.params).toMatchObject({ button: 'right', buttons: 2, clickCount: 3, force: 0.5 });
+  });
+
+  it('dispatches no extra moves when already at the target, so a prior moveTo costs nothing', async () => {
+    const fake = createFakeDebuggerApi();
+    const { sleep } = instantSleep();
+    const tier = new DebuggerInputTier(fake.api, { rng: seededRng(21), sleep });
+    await tier.attach(1);
+    await tier.moveTo(100, 200);
+    fake.calls.length = 0;
+    await tier.click(100, 200);
+
+    // The click's internal moveTo is a degenerate path (from === to): no mouseMoved.
+    expect(fake.calls.filter(c => c.params?.type === 'mouseMoved')).toHaveLength(0);
+    expect(fake.calls.filter(c => c.params?.type === 'mousePressed')).toHaveLength(1);
+    expect(fake.calls.filter(c => c.params?.type === 'mouseReleased')).toHaveLength(1);
   });
 });
 

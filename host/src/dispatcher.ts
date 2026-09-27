@@ -35,6 +35,12 @@ const OPTIONAL_ID_TYPES = new Set(['runlog.append', 'log.append']);
 
 export class Dispatcher {
   readonly #deps: DispatcherDeps;
+  /**
+   * The tail of each run's append chain. main.ts handles frames concurrently, and two
+   * awaited appendFile calls can land in either order -- run.end overtaking run.ended
+   * made the trigger close nb-run's stream before the run's own terminal event.
+   */
+  readonly #runLogTails = new Map<string, Promise<void>>();
 
   constructor(deps: DispatcherDeps) {
     this.#deps = deps;
@@ -90,13 +96,28 @@ export class Dispatcher {
         } catch (err) {
           return this.#fail(m.id, 'bad_request', (err as RunLogError).message);
         }
+        const append = async (): Promise<void> => {
+          try {
+            await appendRunLog(m.runId, m.event, this.#deps.runsDir);
+          } catch (err) {
+            return this.#fail(m.id, 'io', (err as Error).message);
+          }
+          this.#deps.onRunEvent?.(m.runId, m.event);
+          this.#deps.send({ type: 'runlog.ack', ...(m.id ? { id: m.id } : {}), runId: m.runId, ok: true });
+        };
+        // The stored tail is guarded: if this append throws (a subscriber or a dead
+        // socket), the caller still sees the rejection, but the chain itself stays
+        // healthy so later appends are not silently skipped behind a rejected link.
+        const prev = this.#runLogTails.get(m.runId) ?? Promise.resolve();
+        const run = prev.then(append, append);
+        const guarded = run.catch(() => {});
+        this.#runLogTails.set(m.runId, guarded);
         try {
-          await appendRunLog(m.runId, m.event, this.#deps.runsDir);
-        } catch (err) {
-          return this.#fail(m.id, 'io', (err as Error).message);
+          await run;
+        } finally {
+          if (this.#runLogTails.get(m.runId) === guarded) this.#runLogTails.delete(m.runId);
         }
-        this.#deps.onRunEvent?.(m.runId, m.event);
-        return this.#deps.send({ type: 'runlog.ack', ...(m.id ? { id: m.id } : {}), runId: m.runId, ok: true });
+        return;
       }
 
       case 'artifact.save': {

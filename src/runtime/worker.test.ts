@@ -23,6 +23,7 @@ import type { RunEndedEvent, RunHandle, StartRunOptions } from '@/src/agent/run'
 import type { ExtLogEntry } from './errorLog';
 import { RunManager } from './runManager';
 import type { RuntimeDriver } from './pageTools';
+import { memoryStores, type ReplayStore } from './durability';
 import {
   applyRunOptions,
   createWorker,
@@ -113,6 +114,12 @@ class FakeHost implements HostPort {
   abortTrigger: ((msg: { runId: string }) => void) | undefined;
   reloadTrigger: (() => void) | undefined;
   readonly logs: ExtLogEntry[] = [];
+  readonly artifacts: Array<{ runId: string; filename: string; content: string }> = [];
+
+  async saveArtifact(runId: string, filename: string, content: string): Promise<{ path: string; bytes: number }> {
+    this.artifacts.push({ runId, filename, content });
+    return { path: `/artifacts/${runId}/${filename}`, bytes: content.length };
+  }
 
   async keyStatus(): Promise<Readiness> {
     return this.readiness;
@@ -170,6 +177,8 @@ function harness(
     handleUserscript?: Parameters<typeof createWorker>[0]['handleUserscript'];
     tabUrl?: string;
     reloadExtension?: () => void;
+    getLastRunId?: () => Promise<string | null>;
+    replayStore?: ReplayStore;
   } = {},
 ): Harness {
   const host = new FakeHost();
@@ -186,6 +195,7 @@ function harness(
     runUserscript: async (scriptId) => ({ scriptId, ok: true, console: [], durationMs: 0 }),
     start: scripted.start,
     newRunId: () => 'run-1',
+    ...(options.replayStore ? { replayStore: options.replayStore } : {}),
   });
 
   const worker = createWorker({
@@ -196,6 +206,7 @@ function harness(
     now: () => now.value,
     ...(options.handleUserscript ? { handleUserscript: options.handleUserscript } : {}),
     ...(options.reloadExtension ? { reloadExtension: options.reloadExtension } : {}),
+    ...(options.getLastRunId ? { getLastRunId: options.getLastRunId } : {}),
   });
 
   return {
@@ -317,6 +328,46 @@ describe('createWorker: runs', () => {
     expect(h.host.log.every((entry) => entry.runId === 'run-1')).toBe(true);
   });
 
+  it('refuses pixels for a known text-only follower named by the panel, instead of running blind', async () => {
+    const h = harness();
+    const panel = h.connect();
+    panel.send('run.start', {
+      prompt: 'go',
+      config: { ...config, observe: 'pixels' },
+      followerVision: false,
+    });
+    await settle();
+
+    const ended = panel
+      .received('run.event')
+      .map((p) => (p as { event: RunEvent }).event)
+      .find((e) => e.kind === 'run.ended');
+    expect(ended).toMatchObject({ kind: 'run.ended', status: 'error', steps: 0 });
+    expect((ended as { message: string }).message).toContain('cannot see images');
+  });
+
+  it('restores the last run at startup so an unattended run terminates without a panel', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-9', [
+      { kind: 'run.started', runId: 'run-9', prompt: 'go', config, tabId: 3, url: 'https://example.test/', at: 1 },
+      { kind: 'step', n: 1, role: 'follower', at: 2 },
+    ]);
+    const h = harness({ getLastRunId: async () => 'run-9', replayStore: stores.replay });
+    await settle();
+    await settle();
+
+    // The interrupted run got its clean terminal event plus the run.end frame
+    // nb-run exits on — no panel ever connected.
+    const kinds = h.host.log.map((entry) => {
+      const event = entry.event as { kind?: string; type?: string };
+      return event.kind ?? event.type;
+    });
+    expect(kinds).toEqual(['run.ended', 'run.end']);
+    expect(h.host.log[0]?.event).toMatchObject({ status: 'error' });
+    expect(h.host.log[1]?.event).toMatchObject({ type: 'run.end', status: 'error' });
+    expect(h.runManager.replay('run-9').map((e) => e.kind)).toEqual(['run.started', 'step', 'run.ended']);
+  });
+
   it('replays the buffered log for a reopened panel', async () => {
     const h = harness();
     const first = h.connect();
@@ -331,6 +382,51 @@ describe('createWorker: runs', () => {
     const replay = reopened.received('runlog.replay')[0] as { runId: string; events: RunEvent[] };
     expect(replay.runId).toBe('run-1');
     expect(replay.events.map((e) => e.kind)).toEqual(['run.started', 'input.fidelity', 'step', 'run.ended']);
+  });
+
+  it('replays the durable log after a worker restart, ending the interrupted run cleanly (M6)', async () => {
+    const stores = memoryStores();
+    await stores.replay.save('run-9', [
+      {
+        kind: 'run.started',
+        runId: 'run-9',
+        prompt: 'go',
+        config,
+        tabId: 3,
+        url: 'https://example.test/',
+        at: 1,
+      },
+      { kind: 'step', n: 1, role: 'follower', at: 2 },
+    ]);
+
+    // A brand-new manager with an empty ring: everything it knows comes from the store.
+    const host = new FakeHost();
+    const restarted = new RunManager({
+      driver: fakeDriver(),
+      tabs: { activeTab: async () => ({ id: 3, url: 'https://example.test/' }), get: async () => ({ id: 3, url: 'https://example.test/' }) },
+      host,
+      createModel: (model) => new FakeChatModel({ label: model }),
+      runUserscript: async (scriptId) => ({ scriptId, ok: true, console: [], durationMs: 0 }),
+      replayStore: stores.replay,
+    });
+    const worker = createWorker({ host, runManager: restarted, getConfig: async () => config });
+
+    const [workerSide, panelSide] = createFakePortPair();
+    const channel = createChannel<unknown, unknown>(panelSide);
+    const sent: Envelope<unknown>[] = [];
+    channel.onMessage((envelope) => sent.push(envelope));
+    worker.connect(workerSide);
+    channel.send('runlog.replay', { runId: 'run-9' });
+    await settle();
+
+    const replay = sent.filter((e) => e.type === 'runlog.replay').map((e) => e.payload)[0] as {
+      runId: string;
+      events: RunEvent[];
+    };
+    expect(replay.runId).toBe('run-9');
+    expect(replay.events.map((e) => e.kind)).toEqual(['run.started', 'step', 'run.ended']);
+    expect(replay.events.at(-1)).toMatchObject({ status: 'error' });
+    expect((replay.events.at(-1) as { message: string }).message).toContain('restarted');
   });
 
   it('delegates pause, resume and abort to the live run', async () => {
@@ -420,6 +516,42 @@ describe('createWorker: userscripts', () => {
     await settle();
     expect(types).toEqual(['userscript.list', 'userscript.save', 'userscript.delete']);
     expect(panel.received('userscript.list')).toHaveLength(3);
+  });
+
+  it('saves each panel\'s own last result, not whichever panel ran last', async () => {
+    const h = harness({
+      handleUserscript: async (message) => {
+        if (message.type !== 'userscript.run') return undefined;
+        return {
+          type: 'userscript.result',
+          payload: { scriptId: message.payload.scriptId, ok: true, value: { from: message.payload.scriptId }, console: [], durationMs: 1 },
+        };
+      },
+    });
+    const first = h.connect();
+    const second = h.connect();
+
+    first.send('userscript.run', { scriptId: 'first', code: '' });
+    await settle();
+    second.send('userscript.run', { scriptId: 'second', code: '' });
+    await settle();
+    first.send('userscript.saveResult', {});
+    await settle();
+
+    expect(h.host.artifacts).toHaveLength(1);
+    expect(JSON.parse(h.host.artifacts[0]!.content)).toEqual({ from: 'first' });
+    expect(first.received('userscript.saved')).toEqual([
+      { filename: 'userscript.json', path: '/artifacts/panel/userscript.json', bytes: h.host.artifacts[0]!.content.length },
+    ]);
+  });
+
+  it('refuses to save before the panel has a result', async () => {
+    const h = harness();
+    const panel = h.connect();
+    panel.send('userscript.saveResult', {});
+    await settle();
+    expect(panel.received('error')).toEqual([{ message: 'no userscript result to save', inReplyTo: 'userscript.saveResult' }]);
+    expect(h.host.artifacts).toEqual([]);
   });
 
   it('reports a handler failure as an error message rather than dropping the reply', async () => {

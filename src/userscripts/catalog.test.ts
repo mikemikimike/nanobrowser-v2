@@ -5,8 +5,10 @@ import {
   deleteUserscript,
   getUserscript,
   listUserscripts,
+  resolveUserscript,
   saveUserscript,
   seedDefaults,
+  seededNamesItem,
   userscriptsItem,
   validateUserscript,
 } from './catalog';
@@ -48,11 +50,44 @@ describe('userscript catalog', () => {
     expect(edited.id).toBe(first.id);
   });
 
+  it('refuses a create squatting a bundled id, but allows editing the bundled script in place', async () => {
+    const pinned = BUNDLED_USERSCRIPTS[0]!.id;
+    await expect(saveUserscript({ ...draft, id: pinned })).rejects.toThrow(/reserved for its bundled script/);
+
+    const [seeded] = await seedDefaults(() => 7);
+    const edited = await saveUserscript({ ...seeded!, code: 'return 999; // my edit' });
+    expect(edited.id).toBe(pinned);
+    expect(edited.code).toBe('return 999; // my edit');
+  });
+
   it('deletes, and reports whether anything was removed', async () => {
     const saved = await saveUserscript(draft);
     await expect(deleteUserscript('nope')).resolves.toBe(false);
     await expect(deleteUserscript(saved.id)).resolves.toBe(true);
     await expect(listUserscripts()).resolves.toEqual([]);
+  });
+
+  describe('resolveUserscript', () => {
+    it('resolves an id exactly like getUserscript', async () => {
+      const saved = await saveUserscript(draft);
+      await expect(resolveUserscript(saved.id)).resolves.toEqual(saved);
+    });
+
+    it('falls back to an unambiguous name (the live ebay-search-extract loop)', async () => {
+      const saved = await saveUserscript({ ...draft, name: 'ebay-search-extract' });
+      await expect(resolveUserscript('ebay-search-extract')).resolves.toEqual(saved);
+    });
+
+    it('refuses an ambiguous name shared by two scripts', async () => {
+      await saveUserscript({ ...draft, name: 'dup' });
+      await saveUserscript({ ...draft, name: 'dup' });
+      await expect(resolveUserscript('dup')).resolves.toBeUndefined();
+    });
+
+    it('resolves nothing for an unknown id or name', async () => {
+      await saveUserscript(draft);
+      await expect(resolveUserscript('nope')).resolves.toBeUndefined();
+    });
   });
 
   describe('validation', () => {
@@ -130,6 +165,28 @@ describe('userscript catalog', () => {
       expect(after.map((s) => s.name)).not.toContain('ebay-search-extract');
     });
 
+    it('offers ebay-ram-comps once to a profile that already has the older seeds', async () => {
+      const older = BUNDLED_USERSCRIPTS.filter((seed) => seed.name !== 'ebay-ram-comps');
+      await userscriptsItem.setValue(
+        older.map((seed) => ({
+          id: seed.id,
+          name: seed.name,
+          matches: [...seed.matches],
+          code: seed.code,
+          updatedAt: 1,
+        })),
+      );
+      await seededNamesItem.setValue(older.map((seed) => seed.name));
+
+      const offered = await seedDefaults();
+      const ram = offered.filter((script) => script.name === 'ebay-ram-comps');
+      expect(ram).toHaveLength(1);
+
+      await deleteUserscript(ram[0]!.id);
+      const again = await seedDefaults();
+      expect(again.map((script) => script.name)).not.toContain('ebay-ram-comps');
+    });
+
     it('is idempotent across repeated calls', async () => {
       const first = await seedDefaults();
       const second = await seedDefaults();
@@ -142,6 +199,49 @@ describe('userscript catalog', () => {
       const [example] = await seedDefaults();
       const check = validateUserscript(example!);
       expect(check.ok).toBe(true);
+    });
+
+    it('pins stable ids: two fresh profiles seed byte-identical bundled ids', async () => {
+      const first = await seedDefaults(() => 99);
+      expect(first.map((s) => s.id)).toEqual(BUNDLED_USERSCRIPTS.map((s) => s.id));
+
+      // A second profile: empty storage, same bundle, same ids — this is what lets a
+      // cassette recorded in one profile replay in another.
+      fakeBrowser.reset();
+      const second = await seedDefaults(() => 100);
+      expect(second.map((s) => s.id)).toEqual(first.map((s) => s.id));
+    });
+
+    it('migrates an unedited pre-stable-id install to the pinned id', async () => {
+      const seed = BUNDLED_USERSCRIPTS[1]!;
+      await saveUserscript({
+        id: 'old-random-uuid',
+        name: seed.name,
+        matches: [...seed.matches],
+        code: seed.code,
+      });
+      await seededNamesItem.setValue([seed.name]);
+
+      const after = await seedDefaults();
+      const migrated = after.find((s) => s.name === seed.name);
+      expect(migrated!.id).toBe(seed.id);
+      expect(migrated!.code).toBe(seed.code);
+      await expect(listUserscripts()).resolves.toEqual(after);
+    });
+
+    it('leaves an edited bundled copy on its own id', async () => {
+      const seed = BUNDLED_USERSCRIPTS[0]!;
+      const mine = await saveUserscript({
+        name: seed.name,
+        matches: [...seed.matches],
+        code: 'return 999; // my edit',
+      });
+      await seededNamesItem.setValue([seed.name]);
+
+      const after = await seedDefaults();
+      const kept = after.find((s) => s.name === seed.name);
+      expect(kept!.id).toBe(mine.id);
+      expect(kept!.code).toBe('return 999; // my edit');
     });
   });
 

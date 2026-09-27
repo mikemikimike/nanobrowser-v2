@@ -2,18 +2,23 @@
  * Bundled example userscripts. `seedDefaults()` installs these once, on an empty
  * catalog, so a fresh install has something real to run and debug (R-09/R-10).
  *
- * Every bundled example is read-only by construction: it reads the DOM and returns
- * JSON. No writes, no navigation, no fetch — a bundled script must never do
- * anything the user did not ask for on a site they happen to have open.
+ * The observers read the DOM and return JSON. `ebay-ram-comps` is the exception:
+ * it GETs eBay search HTML and returns JSON. It does not write the DOM.
  *
  * The wrapper in `runner.ts` runs a script as the body of an async function, so a
  * script hands its result back with a top-level `return`.
  */
 import type { Userscript } from '@/src/messaging';
+import { EBAY_RAM_COMPS_CODE } from './ebay-ram';
 import { DEFAULT_PROBE_GLOBALS, buildProbeCode } from './i03';
 
-/** A bundled example, before the catalog stamps an id and `updatedAt` on it. */
-export type UserscriptSeed = Omit<Userscript, 'id' | 'updatedAt'>;
+/** A bundled example, before the catalog stamps `updatedAt` on it.
+ *
+ * The `id` is pinned, not generated: the Follower prompt names each available
+ * userscript by id, and that prompt is part of the cassette key, so a random id
+ * per install would make a cassette recorded in one profile miss in another.
+ * Stable ids are what make "record once, replay anywhere" true. */
+export type UserscriptSeed = Omit<Userscript, 'updatedAt'>;
 
 /**
  * Reads the Hyperagent thread list and reports each thread's title and status
@@ -76,6 +81,7 @@ return {
 `;
 
 export const HYPERAGENT_OBSERVE: UserscriptSeed = {
+  id: 'bundled-hyperagent-observe',
   name: 'hyperagent-observe',
   matches: ['*://hyperagent.com/*', '*://www.hyperagent.com/*'],
   code: HYPERAGENT_OBSERVE_CODE,
@@ -210,6 +216,7 @@ return results;
 `;
 
 export const EBAY_SEARCH_EXTRACT: UserscriptSeed = {
+  id: 'bundled-ebay-search-extract',
   name: 'ebay-search-extract',
   matches: ['*://www.ebay.com/sch/*', '*://ebay.com/sch/*'],
   code: EBAY_SEARCH_EXTRACT_CODE,
@@ -238,7 +245,15 @@ export const EBAY_SEARCH_EXTRACT: UserscriptSeed = {
  * read, it only reads, and `sameOriginFetch` is baked to false at seed time so the
  * probe issues no request at all.
  */
+export const EBAY_RAM_COMPS: UserscriptSeed = {
+  id: 'bundled-ebay-ram-comps',
+  name: 'ebay-ram-comps',
+  matches: ['*://www.ebay.com/*', '*://ebay.com/*'],
+  code: EBAY_RAM_COMPS_CODE,
+};
+
 export const I03_PAGE_ACCESS: UserscriptSeed = {
+  id: 'bundled-i03-page-access',
   name: 'i03-page-access',
   matches: ['*://*/*'],
   code: buildProbeCode(DEFAULT_PROBE_GLOBALS, false),
@@ -248,5 +263,6 @@ export const I03_PAGE_ACCESS: UserscriptSeed = {
 export const BUNDLED_USERSCRIPTS: readonly UserscriptSeed[] = [
   HYPERAGENT_OBSERVE,
   EBAY_SEARCH_EXTRACT,
+  EBAY_RAM_COMPS,
   I03_PAGE_ACCESS,
 ];

@@ -11,8 +11,8 @@
  * screenshots are sent on every step (docs/research/models-and-grounding.md §6).
  * OpenRouter's `:free` endpoints exist only under the training data policy, so
  * "deny" yields `404 No endpoints found matching your data policy`; the user
- * chose free models knowingly (see the live run in docs/STATUS.md), so those
- * get "allow".
+ * chose free models knowingly (a live run on the free pair ended `error 404`
+ * under "deny" before this mapping existed), so those get "allow".
  */
 export function dataCollectionFor(model: string): 'allow' | 'deny' {
   return model.endsWith(':free') ? 'allow' : 'deny';
@@ -134,10 +134,11 @@ export function createChatModel(options: CreateChatModelOptions): ChatOpenAI {
 /* Test double                                                               */
 /* ------------------------------------------------------------------------- */
 
-/** One scripted model turn: plain text, or a single tool call. */
+/** One scripted model turn: plain text, a single tool call, or a batched pair. */
 export type FakeTurn =
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; name: string; args: Record<string, unknown>; text?: string };
+  | { kind: 'tool'; name: string; args: Record<string, unknown>; text?: string }
+  | { kind: 'tools'; calls: { name: string; args: Record<string, unknown> }[]; text?: string };
 
 export interface FakeCall {
   /** Zero-based index of this call on this model instance. */
@@ -218,6 +219,22 @@ export class FakeChatModel extends BaseChatModel {
     if (turn.kind === 'text') {
       const message = new AIMessage({ content: turn.text });
       return { generations: [{ text: turn.text, message }] };
+    }
+
+    if (turn.kind === 'tools') {
+      const message = new AIMessage({
+        content: turn.text ?? '',
+        tool_calls: turn.calls.map((c) => {
+          this.#toolCallSeq += 1;
+          return {
+            id: `${this.label}-call-${this.#toolCallSeq}`,
+            name: c.name,
+            args: c.args,
+            type: 'tool_call' as const,
+          };
+        }),
+      });
+      return { generations: [{ text: turn.text ?? '', message }] };
     }
 
     this.#toolCallSeq += 1;

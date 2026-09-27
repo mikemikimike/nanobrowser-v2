@@ -148,6 +148,49 @@ describe('UserscriptsSection results', () => {
   });
 });
 
+describe('editor error line and save', () => {
+  it('moves the editor to the error line', () => {
+    const code = Array.from({ length: 20 }, (_, index) => `const line${index} = ${index};`).join('\n');
+    setup({
+      scripts: [{ ...SCRIPT, code }],
+      result: {
+        scriptId: SCRIPT.id,
+        ok: false,
+        error: 'SyntaxError: Unexpected token (line 12, column 1)',
+        console: [],
+        durationMs: 4,
+      },
+    });
+
+    const area = screen.getByLabelText('Code') as HTMLTextAreaElement;
+    expect(area.scrollTop).toBe(11 * 16);
+    expect(screen.getByTestId('script-lines').textContent).toContain('12');
+    expect(area.value).toBe(code);
+    expect(area.selectionStart).toBe(code.indexOf('const line11 '));
+  });
+
+  it('says where Save JSON wrote the file once the host confirms it', () => {
+    setup({
+      result: { scriptId: SCRIPT.id, ok: true, value: { rows: [] }, console: [], durationMs: 4 },
+      saved: { filename: 'userscript.json', path: '/artifacts/panel/userscript.json', bytes: 12 },
+    });
+
+    expect(screen.getByTestId('script-saved').textContent).toContain('/artifacts/panel/userscript.json');
+  });
+
+  it('saves the result value when Save JSON is clicked', async () => {
+    const onSaveResult = vi.fn();
+    const value = { summary: [{ n: 1 }], rows: [{ id: 'a' }] };
+    setup({
+      onSaveResult,
+      result: { scriptId: SCRIPT.id, ok: true, value, console: [], durationMs: 4 },
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save JSON' }));
+    expect(onSaveResult).toHaveBeenCalledWith(value);
+  });
+});
+
 describe('who wrote each script (O-03)', () => {
   it('marks a script the agent wrote and leaves the user\'s own unmarked', () => {
     setup({

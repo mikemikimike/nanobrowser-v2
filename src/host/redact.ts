@@ -18,6 +18,13 @@ const SCREENSHOT_OMITTED = '[screenshot omitted]';
 const OPENROUTER_KEY_RE = /sk-or-[A-Za-z0-9._-]+/gi;
 /** Any bearer token, provider-agnostic. Case-insensitive: header values are not case-sensitive by convention. */
 const BEARER_RE = /Bearer\s+\S+/gi;
+/**
+ * Other providers' `sk-` tokens, mirroring the host's `KEY_SHAPES` (`host/src/log.ts`).
+ * Kept in sync by hand; a drift here once left a dotted key half-redacted.
+ */
+const SK_KEY_RE = /\bsk-[A-Za-z0-9]{20,}\b/g;
+/** A Doppler CLI/personal or service token, mirroring the host. */
+const DOPPLER_TOKEN_RE = /\bdp\.(?:ct|st)\.[A-Za-z0-9._-]{8,}/g;
 /** A base64 image data URL, as a screenshot would appear inline in an event. */
 const SCREENSHOT_DATA_URL_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g;
 
@@ -31,6 +38,8 @@ export function redactText(value: string): string {
   return value
     .replace(SCREENSHOT_DATA_URL_RE, SCREENSHOT_OMITTED)
     .replace(OPENROUTER_KEY_RE, REDACTED)
+    .replace(SK_KEY_RE, REDACTED)
+    .replace(DOPPLER_TOKEN_RE, REDACTED)
     .replace(BEARER_RE, REDACTED);
 }
 

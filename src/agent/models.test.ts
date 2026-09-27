@@ -84,6 +84,14 @@ describe('hardenOpenRouterFetch', () => {
     expect(res.status).toBe(502);
   });
 
+  it('passes a model catalog through: {object:"list"} is not a choice-less completion', async () => {
+    const catalog = { object: 'list', data: [{ id: 'x/y:free', object: 'model' }, { id: 'a/b', object: 'model' }] };
+    const f = hardenOpenRouterFetch(async () => jsonResponse(catalog));
+    const res = await f('https://openrouter.ai/api/v1/models');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(catalog);
+  });
+
   it('leaves non-JSON and non-200 replies alone', async () => {
     const f = hardenOpenRouterFetch(async () => new Response('nope', { status: 404, headers: { 'content-type': 'text/plain' } }));
     const res = await f('https://openrouter.ai/api/v1/models');

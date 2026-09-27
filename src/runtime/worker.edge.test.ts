@@ -80,6 +80,7 @@ function fakeRunManager(overrides: Partial<RunManagerPort> = {}): RunManagerPort
     resume: () => true,
     abort: () => true,
     replay: () => [],
+    restoreReplay: async () => {},
     navigateActiveTab: async () => {},
     resolveTabId: async () => 1,
     activeRunId: undefined,

@@ -20,6 +20,8 @@ import {
   type RuntimePageTools,
   type SaveArtifact,
 } from './pageTools';
+import { memoryStores, type UserscriptValueStore } from './durability';
+import { EBAY_RAM_COMPS, I03_PAGE_ACCESS } from '@/src/userscripts/examples';
 
 interface Call {
   name: string;
@@ -127,8 +129,8 @@ class FakeDebuggerTier implements InputTier {
   async typeText(text: string): Promise<void> {
     this.calls.push({ name: 'typeText', args: [text] });
   }
-  async press(key: string): Promise<void> {
-    this.calls.push({ name: 'press', args: [key] });
+  async press(key: string, opts?: unknown): Promise<void> {
+    this.calls.push({ name: 'press', args: opts === undefined ? [key] : [key, opts] });
   }
   async scroll(x: number, y: number, dx: number, dy: number): Promise<void> {
     this.calls.push({ name: 'scroll', args: [x, y, dx, dy] });
@@ -159,7 +161,10 @@ function harness(
     withDebugger?: boolean;
     runId?: string;
     saveArtifact?: SaveArtifact;
+    readOnly?: boolean;
+    userscriptValueStore?: UserscriptValueStore;
     listUserscripts?: () => Promise<Userscript[]>;
+    resolveUserscript?: (idOrName: string) => Promise<Userscript | undefined>;
     writeUserscript?: (request: WriteUserscriptRequest) => Promise<AgentWriteResult>;
   } = {},
 ): Harness {
@@ -200,9 +205,12 @@ function harness(
     },
     sleep: async () => {},
     ...(options.listUserscripts ? { listUserscripts: options.listUserscripts } : {}),
+    ...(options.resolveUserscript ? { resolveUserscript: options.resolveUserscript } : {}),
     ...(options.writeUserscript ? { writeUserscript: options.writeUserscript } : {}),
     ...(options.runId !== undefined ? { runId: options.runId } : {}),
     ...(options.saveArtifact ? { saveArtifact: options.saveArtifact } : {}),
+    ...(options.userscriptValueStore ? { userscriptValueStore: options.userscriptValueStore } : {}),
+    ...(options.readOnly ? { readOnly: true } : {}),
   });
 
   return state;
@@ -231,7 +239,6 @@ describe('createPageTools', () => {
     await h.tools.click('e7');
     await h.tools.type('e7', 'hello');
     await h.tools.press('Enter');
-
     expect(h.driver.calls).toEqual([
       { name: 'click', args: [TAB, 'e7'] },
       { name: 'type', args: [TAB, 'e7', 'hello'] },
@@ -254,6 +261,23 @@ describe('createPageTools', () => {
       { name: 'click', args: [120, 210] },
     ]);
     expect(h.driver.names).not.toContain('click');
+  });
+
+  it('replaces the field on escalated type: click to focus, Ctrl+A, then type', async () => {
+    const h = harness('escalated');
+    await h.input.attach(TAB);
+    await h.tools.type('e7', 'hello');
+
+    // The type tool contract is replace-by-default on every tier: the in-page
+    // tier clears first, so the escalated path selects all before typing.
+    expect(h.debuggerTier?.calls).toEqual([
+      { name: 'attach', args: [TAB] },
+      { name: 'moveTo', args: [120, 210] },
+      { name: 'click', args: [120, 210] },
+      { name: 'press', args: ['a', { modifiers: { ctrl: true } }] },
+      { name: 'typeText', args: ['hello'] },
+    ]);
+    expect(h.driver.names).not.toContain('type');
   });
 
   it('attaches the debugger tier once for the whole run and detaches at the end', async () => {
@@ -338,6 +362,12 @@ describe('createPageTools', () => {
     expect(h.driver.calls.at(-1)).toEqual({ name: 'extractText', args: [TAB, { maxChars: 500 }] });
   });
 
+  it('reports a ref viewport box in CSS pixels for screenshot correlation', async () => {
+    const h = harness('in-page');
+    expect(await h.tools.getBox('e7')).toEqual({ x: 100, y: 200, width: 40, height: 20 });
+    expect(h.driver.calls.at(-1)).toEqual({ name: 'getBox', args: [TAB, 'e7'] });
+  });
+
   it('truncates run_userscript\'s own echoed JSON at ~60000 chars but keeps it retrievable in full', async () => {
     const h = harness('in-page', { saveArtifact: async (filename, content) => ({ path: `/artifacts/${filename}`, bytes: content.length }) });
     h.userscriptResult = { scriptId: 's1', ok: true, value: { big: 'x'.repeat(70_000) }, console: [], durationMs: 1 };
@@ -355,6 +385,116 @@ describe('createPageTools', () => {
   it('save_file refuses fromLastUserscript when nothing has run yet', async () => {
     const h = harness('in-page');
     await expect(h.tools.saveFile('a.json', undefined, true)).rejects.toThrow('no userscript has run yet');
+  });
+
+  it('retains the last userscript value across tool instances via the store (M6)', async () => {
+    const stores = memoryStores();
+    const before = harness('in-page', { userscriptValueStore: stores.values });
+    before.userscriptResult = { scriptId: 's1', ok: true, value: { rows: [1, 2] }, console: [], durationMs: 1 };
+    await before.tools.runUserscript('s1');
+    // Let the fire-and-forget durable save land.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A new tool instance with an empty closure — as after a worker restart —
+    // still saves the full value instead of failing.
+    const after = harness('in-page', { userscriptValueStore: stores.values, runId: 'run-9' });
+    const saved = await after.tools.saveFile('rows.json', undefined, true);
+    expect(saved).toContain('rows.json');
+    expect(after.driver.calls.at(-1)?.name).toBe('saveFile');
+  });
+
+  it('fails legibly when the value was lost to a restart (M6)', async () => {
+    const stores = memoryStores();
+    const h = harness('in-page', { userscriptValueStore: stores.values });
+    await expect(h.tools.saveFile('a.json', undefined, true)).rejects.toThrow(
+      'the last userscript value was lost to a restart: re-run the script, then save again',
+    );
+  });
+});
+
+describe('read-only runs (M9 #13)', () => {
+  it('refuses every acting tool with a legible mode error, touching nothing', async () => {
+    const h = harness('in-page', { readOnly: true });
+    await h.input.attach(TAB);
+
+    await expect(h.tools.click('e7')).rejects.toThrow('read-only run: click is unavailable');
+    await expect(h.tools.hover('e7')).rejects.toThrow('read-only run: hover is unavailable');
+    await expect(h.tools.type('e7', 'x')).rejects.toThrow('read-only run: type is unavailable');
+    await expect(h.tools.press('Enter')).rejects.toThrow('read-only run: press is unavailable');
+    await expect(h.tools.select('e7', 'm')).rejects.toThrow('read-only run: select is unavailable');
+    await expect(h.tools.download('https://x.test/a.csv')).rejects.toThrow('read-only run: download is unavailable');
+    await expect(
+      h.tools.writeUserscript({ name: 'x', matches: ['*://x.test/*'], code: 'return 1;' }),
+    ).rejects.toThrow('read-only run: write_userscript is unavailable');
+    // Defense in depth held: the driver saw nothing at all.
+    expect(h.driver.calls).toEqual([]);
+  });
+
+  it('still reads, navigates, scrolls, and saves', async () => {
+    const h = harness('in-page', { readOnly: true, runId: 'run-ro' });
+    expect((await h.tools.snapshot()).text).toContain('[ref=e7]');
+    expect(await h.tools.extractText()).toBe('extracted');
+    expect(await h.tools.navigate('https://x.test/next')).toContain('https://x.test/next');
+    expect(await h.tools.scroll('down')).toContain('down');
+    expect(await h.tools.getBox('e7')).toMatchObject({ x: 100, y: 200 });
+    expect(await h.tools.saveFile('notes.txt', 'read-only notes', false)).toContain('notes.txt');
+  });
+
+  it('runs a read-only userscript but refuses a writing one', async () => {
+    const reader: Userscript = {
+      id: 'reader',
+      name: 'reader',
+      matches: ['*://x.test/*'],
+      code: 'return [...document.querySelectorAll("h1")].map((h) => h.textContent);',
+      updatedAt: 0,
+      author: 'agent',
+    };
+    const writer: Userscript = { ...reader, id: 'writer', name: 'writer', code: 'form.submit();' };
+    const resolve = async (idOrName: string) =>
+      [reader, writer].find((s) => s.id === idOrName || s.name === idOrName);
+    const h = harness('in-page', { readOnly: true, resolveUserscript: resolve });
+
+    expect(await h.tools.runUserscript('reader')).toContain('reader');
+    await expect(h.tools.runUserscript('writer')).rejects.toThrow('read-only run: writer');
+    expect(h.userscriptRuns).toEqual(['reader']);
+  });
+
+  it('runs a bundled seed as shipped but scans one the user edited in place', async () => {
+    const shipped: Userscript = { ...I03_PAGE_ACCESS, updatedAt: 0 };
+    const edited: Userscript = { ...EBAY_RAM_COMPS, code: 'form.submit();', updatedAt: 0 };
+    const resolve = async (idOrName: string) => [shipped, edited].find((s) => s.id === idOrName);
+    const h = harness('in-page', { readOnly: true, resolveUserscript: resolve });
+
+    await h.tools.runUserscript(shipped.id);
+    await expect(h.tools.runUserscript(edited.id)).rejects.toThrow(`read-only run: ${edited.id}`);
+    expect(h.userscriptRuns).toEqual([shipped.id]);
+  });
+
+  it('refuses run_userscript when the source cannot be verified', async () => {
+    const withoutCatalog = harness('in-page', { readOnly: true });
+    await expect(withoutCatalog.tools.runUserscript('s1')).rejects.toThrow('no catalog in this run');
+
+    const withCatalog = harness('in-page', { readOnly: true, resolveUserscript: async () => undefined });
+    await expect(withCatalog.tools.runUserscript('ghost')).rejects.toThrow('unknown userscript ghost');
+  });
+
+  it('resolves from the whole catalog, not the starting-URL-filtered list', async () => {
+    // A read-only run that navigated elsewhere: the display list omits the
+    // destination-matching script, but the preflight still verifies its source.
+    const dest: Userscript = {
+      id: 'u9',
+      name: 'dest-reader',
+      matches: ['*://b.test/*'],
+      code: 'return document.title;',
+      updatedAt: 0,
+    };
+    const h = harness('in-page', {
+      readOnly: true,
+      listUserscripts: async () => [],
+      resolveUserscript: async (idOrName) => (idOrName === 'u9' || idOrName === 'dest-reader' ? dest : undefined),
+    });
+    expect(await h.tools.runUserscript('dest-reader')).toContain('dest-reader');
+    expect(h.userscriptRuns).toEqual(['dest-reader']);
   });
 
   it('save_file downloads to the Downloads folder and emits a file.saved event', async () => {
@@ -555,6 +695,102 @@ describe('the agent\'s userscript loop (R-09/R-10, O-03)', () => {
   });
 });
 
+describe('userscript read, summary, and save', () => {
+  it('returns the source of a saved script', async () => {
+    const h = harness('in-page', {
+      resolveUserscript: async (id) =>
+        id === 'bundled-ebay-ram-comps'
+          ? {
+              id,
+              name: 'ebay-ram-comps',
+              matches: ['*://www.ebay.com/*'],
+              code: 'return { summary: [] };',
+              updatedAt: 0,
+            }
+          : undefined,
+    });
+
+    await expect(h.tools.readUserscript('bundled-ebay-ram-comps')).resolves.toContain('return { summary: [] };');
+  });
+
+  it('leaves summary in the reply when rows are huge', async () => {
+    const h = harness('in-page');
+    h.userscriptResult = {
+      scriptId: 's1',
+      ok: true,
+      value: { summary: { kits: 2 }, meta: { source: 'ebay.com' }, log: [], rows: [{ blob: 'x'.repeat(80_000) }] },
+      console: [],
+      durationMs: 5,
+    };
+
+    const reply = await h.tools.runUserscript('s1');
+    expect(reply).toContain('"kits":2');
+    expect(reply).toContain('rows are not in this reply');
+    expect(reply).not.toContain('x'.repeat(80));
+  });
+
+  it('keeps the last error line when the first lines are noise', () => {
+    const lines = [
+      { level: 'error' as const, text: 'challenge page', at: 0 },
+      ...Array.from({ length: 50 }, (_, index) => ({ level: 'log' as const, text: `noise ${index}`, at: index + 1 })),
+    ];
+    const out = formatUserscriptConsole(lines, 40);
+    expect(out).toContain('[error] challenge page');
+    expect(out).not.toContain('[log] noise 0');
+  });
+
+  it('lets save_file write rows collected before a throw', async () => {
+    const saved: string[] = [];
+    const h = harness('in-page', {
+      saveArtifact: async (_filename, content) => {
+        saved.push(content);
+        return { path: '/artifacts/rows.json', bytes: content.length };
+      },
+    });
+    h.userscriptResult = {
+      scriptId: 's1',
+      ok: false,
+      error: 'boom',
+      value: { summary: [], rows: [{ item_id: '1' }], log: [], meta: {} },
+      console: [],
+      durationMs: 5,
+    };
+
+    await expect(h.tools.runUserscript('s1')).rejects.toThrow('boom');
+    const reply = await h.tools.saveFile('rows.json', undefined, true);
+    expect(reply).toContain('rows.json');
+    expect(saved[0]).toContain('"item_id": "1"');
+  });
+
+  it('persists the summary when the rows exceed 8 MiB and does not encode those rows', async () => {
+    const saved: string[] = [];
+    const h = harness('in-page', {
+      saveArtifact: async (_filename, content) => {
+        saved.push(content);
+        return { path: '/artifacts/rows.json', bytes: content.length };
+      },
+    });
+    const huge = 'Z'.repeat(8 * 1024 * 1024 + 1000);
+    h.userscriptResult = {
+      scriptId: 's1',
+      ok: true,
+      value: { summary: { kits: 1 }, log: ['page 1'], meta: { source: 'ebay.com' }, rows: [huge] },
+      console: [],
+      durationMs: 5,
+    };
+
+    await h.tools.runUserscript('s1');
+    const reply = await h.tools.saveFile('rows.json', undefined, true);
+    expect(reply).toContain('rows exceeded 8 MiB');
+    expect(saved[0]).toContain('"kits": 1');
+    expect(saved[0]).toContain('rows_dropped');
+    expect(saved[0]).not.toContain(huge.slice(0, 100));
+    const dataUrl = String(h.driver.calls.find((call) => call.name === 'saveFile')?.args[0]);
+    expect(dataUrl.startsWith('data:')).toBe(true);
+    expect(dataUrl).not.toContain(huge.slice(0, 80));
+  });
+});
+
 describe('formatUserscriptConsole', () => {
   it('is empty for a script that logged nothing, so the reply stays short', () => {
     expect(formatUserscriptConsole([])).toBe('');
@@ -563,9 +799,22 @@ describe('formatUserscriptConsole', () => {
   it('caps the number of lines and says how many it dropped', () => {
     const lines = Array.from({ length: 6 }, (_, i) => ({ level: 'log' as const, text: `line ${i}`, at: i }));
     const out = formatUserscriptConsole(lines, 4);
-    expect(out).toContain('[log] line 3');
-    expect(out).not.toContain('[log] line 4');
+    expect(out).toContain('[log] line 5');
+    expect(out).not.toContain('[log] line 0');
     expect(out).toContain('… 2 more console lines');
+  });
+
+  it('keeps an early error inside both caps and counts what it dropped', () => {
+    const lines = [
+      { level: 'error' as const, text: 'challenge page', at: 0 },
+      ...Array.from({ length: 10 }, (_, i) => ({ level: 'log' as const, text: `noise ${i}`, at: i + 1 })),
+    ];
+    const out = formatUserscriptConsole(lines, 4, 60);
+    const shown = out.split('\n').filter((line) => line.startsWith('['));
+    expect(shown).toHaveLength(3);
+    expect(shown.join('\n').length).toBeLessThanOrEqual(60);
+    expect(shown.at(-1)).toBe('[error] challenge page');
+    expect(out).toContain('… 8 more console lines');
   });
 
   it('caps by size too, so one enormous log line cannot crowd out the result', () => {
@@ -574,8 +823,8 @@ describe('formatUserscriptConsole', () => {
       { level: 'log' as const, text: 'b'.repeat(50), at: 2 },
     ];
     const out = formatUserscriptConsole(lines, 10, 60);
-    expect(out).toContain('a'.repeat(50));
-    expect(out).not.toContain('b'.repeat(50));
+    expect(out).toContain('b'.repeat(50));
+    expect(out).not.toContain('a'.repeat(50));
     expect(out).toContain('… 1 more console line');
   });
 });

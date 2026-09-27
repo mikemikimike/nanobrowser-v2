@@ -10,6 +10,9 @@ import type { Userscript } from '@/src/messaging';
 import { isValidMatchPattern } from './match-pattern';
 import { BUNDLED_USERSCRIPTS, type UserscriptSeed } from './examples';
 
+/** Pinned ids of the bundled seeds. Caller-supplied drafts may never take one. */
+const STABLE_SEED_IDS = new Set(BUNDLED_USERSCRIPTS.map((seed) => seed.id));
+
 export const userscriptsItem = storage.defineItem<Userscript[]>('local:userscripts', {
   fallback: [],
   version: 1,
@@ -88,6 +91,23 @@ export async function getUserscript(id: string): Promise<Userscript | undefined>
   return (await listUserscripts()).find((script) => script.id === id);
 }
 
+/**
+ * Resolves what the Follower passed as `scriptId`, tolerating the human-readable
+ * name. Seen live: the per-turn prompt shows `<id> (ebay-search-extract)` and a
+ * weak Follower echoes the parenthesized name instead of the id, so a strict lookup
+ * fails a run that had the right script in front of it. An exact name match resolves
+ * only when it is unambiguous — two scripts sharing a name (or none) still fail
+ * strict, with the caller naming what is available. Ids (pinned `bundled-*` values
+ * for bundled scripts, UUIDs for user scripts) never collide with names, so trying
+ * the id first keeps this a pure fallback.
+ */
+export async function resolveUserscript(idOrName: string): Promise<Userscript | undefined> {
+  const direct = await getUserscript(idOrName);
+  if (direct) return direct;
+  const named = (await listUserscripts()).filter((script) => script.name === idOrName);
+  return named.length === 1 ? named[0] : undefined;
+}
+
 export interface SaveOptions {
   /**
    * Refuse to replace an existing script unless it carries this author.
@@ -118,6 +138,16 @@ export async function saveUserscript(
   const current = await listUserscripts();
   const index = current.findIndex((existing) => existing.id === script.id);
 
+  // A create squatting a bundled id would make seedDefaults treat it as the bundled
+  // script and never install the real example. Replacing the script that already
+  // holds the id (editing the bundled example in place) stays allowed; seeding and
+  // migration write through setValue directly and never pass through here.
+  if (index < 0 && STABLE_SEED_IDS.has(script.id)) {
+    throw new Error(
+      `id ${JSON.stringify(script.id)} is reserved for its bundled script. Omit scriptId to create a copy of your own.`,
+    );
+  }
+
   if (index >= 0 && options.requireAuthor && current[index]!.author !== options.requireAuthor) {
     throw new Error(
       `${script.id} ("${current[index]!.name}") was written by the user and cannot be overwritten. ` +
@@ -144,7 +174,7 @@ export async function clearUserscripts(): Promise<void> {
 }
 
 function seedToScript(seed: UserscriptSeed, now: () => number): Userscript {
-  return { id: crypto.randomUUID(), name: seed.name, matches: [...seed.matches], code: seed.code, updatedAt: now() };
+  return { id: seed.id, name: seed.name, matches: [...seed.matches], code: seed.code, updatedAt: now() };
 }
 
 /**
@@ -168,6 +198,10 @@ export const seededNamesItem = storage.defineItem<string[]>('local:userscripts.s
  * extractor was invisible on a profile that had been running since before it
  * existed. Deleted and edited examples still stay gone, because the decision is
  * made from the offer record rather than from the catalog's contents.
+ *
+ * Bundled installs carry pinned ids (see `UserscriptSeed`), so two fresh profiles
+ * seed byte-identical catalogs and a cassette recorded in one replays in another.
+ * Unedited pre-stable-id installs are migrated to the pinned id in place.
  */
 export async function seedDefaults(now: () => number = Date.now): Promise<Userscript[]> {
   const current = await listUserscripts();
@@ -179,13 +213,42 @@ export async function seedDefaults(now: () => number = Date.now): Promise<Usersc
     for (const script of current) offered.add(script.name);
   }
 
-  const missing = BUNDLED_USERSCRIPTS.filter((seed) => !offered.has(seed.name));
+  // Migrate pre-stable-id installs. A bundled script seeded before ids were pinned
+  // carries a random UUID; when the stored copy is byte-identical to the seed it is
+  // the bundled script, not user work, so rewrite its id to the pinned one. Edited
+  // copies, agent-written scripts, and user scripts that happen to share a name keep
+  // their ids — their catalogs genuinely differ, and a cassette miss there is correct.
+  const seedByName = new Map(BUNDLED_USERSCRIPTS.map((seed) => [seed.name, seed]));
+  const stableIds = new Set(BUNDLED_USERSCRIPTS.map((seed) => seed.id));
+  const takenStable = new Set(current.filter((s) => stableIds.has(s.id)).map((s) => s.id));
+  let migrated = current;
+  let changed = false;
+  migrated = current.map((script) => {
+    if (stableIds.has(script.id)) return script;
+    const seed = seedByName.get(script.name);
+    if (!seed || takenStable.has(seed.id) || script.author === 'agent') return script;
+    if (script.code !== seed.code) return script;
+    if (
+      script.matches.length !== seed.matches.length ||
+      !script.matches.every((pattern, i) => pattern === seed.matches[i])
+    ) {
+      return script;
+    }
+    changed = true;
+    takenStable.add(seed.id);
+    return { ...script, id: seed.id };
+  });
+
+  const missing = BUNDLED_USERSCRIPTS.filter(
+    (seed) => !offered.has(seed.name) && !migrated.some((script) => script.id === seed.id),
+  );
   if (missing.length === 0) {
+    if (changed) await userscriptsItem.setValue(migrated);
     await seededNamesItem.setValue([...offered]);
-    return current;
+    return migrated;
   }
 
-  const next = [...current, ...missing.map((seed) => seedToScript(seed, now))];
+  const next = [...migrated, ...missing.map((seed) => seedToScript(seed, now))];
   await userscriptsItem.setValue(next);
   await seededNamesItem.setValue([...offered, ...missing.map((seed) => seed.name)]);
   return next;
